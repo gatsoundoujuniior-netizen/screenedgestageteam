@@ -1,0 +1,54 @@
+name: GAFI Monitor — ScreenEdge Africa
+
+on:
+  schedule:
+    # Toutes les semaines le lundi à 08h00 UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    # Déclenchement manuel possible depuis GitHub → Actions
+
+jobs:
+  gafi-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Installation des dépendances
+        run: |
+          pip install \
+            langchain-tavily==0.2.18 \
+            langchain==1.3.1 \
+            python-dotenv==1.2.2 \
+            pydantic==2.13.4
+
+      - name: Lancer le monitoring GAFI
+        env:
+          TAVILY_API_KEY:    ${{ secrets.TAVILY_API_KEY }}
+          EMAIL_SENDER:      ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:    ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENTS:  ${{ secrets.EMAIL_RECIPIENTS }}
+        run: python gafi_monitor.py
+
+      - name: Sauvegarder le rapport JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: gafi-rapport-${{ github.run_id }}
+          path: gafi_rapport.json
+          retention-days: 90
+
+      - name: Committer les mises à jour du référentiel
+        run: |
+          git config user.name  "GAFI Monitor Bot"
+          git config user.email "bot@screenedge-africa.com"
+          git diff --quiet || (
+            git add "aml-pep-research-agent (1).md" &&
+            git commit -m "GAFI Monitor: mise à jour automatique référentiel $(date +'%d/%m/%Y')" &&
+            git push
+          )
