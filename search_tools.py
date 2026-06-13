@@ -8,8 +8,9 @@ Hiérarchie des sources :
   Tier 3 — Référence compliance: OpenSanctions, OCCRP, FATF → alerte/enrichissement seulement
 """
 
-import sys, re, json
+import sys, re, json, unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -20,6 +21,24 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 tavily = TavilySearch(max_results=10, search_depth="advanced")
+
+# ── Compteur global Tavily ───────────────────────────────────────────────────────
+_tavily_compteur = {"total": 0, "par_personne": 0}
+
+def _tavily_invoke(instance, query: str, label: str = "") -> any:
+    """Wrapper Tavily avec comptage automatique."""
+    _tavily_compteur["total"]       += 1
+    _tavily_compteur["par_personne"] += 1
+    if label:
+        print(f"  [Tavily #{_tavily_compteur['total']}] {label[:60]}")
+    return instance.invoke({"query": query})
+
+def reset_compteur_personne():
+    """Remet à zéro le compteur par personne (appelé au début de chaque verifier_pep)."""
+    _tavily_compteur["par_personne"] = 0
+
+def get_compteur() -> dict:
+    return dict(_tavily_compteur)
 
 # ── TIER 1 : Sources officielles directes (valident seules) ────────────────────
 
@@ -124,9 +143,9 @@ DOMAINES_OFFICIELS_PAR_PAYS = {
         "bceao.int",
     ],
     "TG": [
-        "presidence.tg", "gouv.tg", "assemblee-nationale.tg",
-        "centif.tg", "republicoftogo.com", "jo.gouv.tg",
-        "bceao.int",
+        "presidence.gouv.tg", "togo.gouv.tg",
+        "assemblee-nationale.tg", "centif.tg", "jo.gouv.tg",
+        "atop.tg", "bceao.int",
     ],
     "BJ": [
         "presidence.bj", "gouv.bj", "assemblee-nationale.bj",
@@ -176,9 +195,7 @@ def extraire_liens_officiels_wikipedia(nom_complet: str) -> list[str]:
     NE PAS utiliser pour valider une fonction PEP.
     """
     try:
-        res = tavily.invoke({
-            "query": f'site:wikipedia.org "{nom_complet}" politique gouvernement'
-        })
+        res = _tavily_invoke(tavily, f'site:wikipedia.org "{nom_complet}" politique gouvernement', "Wikipedia liens officiels")
         if not res:
             return []
 
@@ -219,15 +236,21 @@ def annoter_sources(texte: str) -> str:
         return url
     return re.sub(r'https?://[^\s\'">,]+', remplacer, texte)
 
+def _normaliser(s: str) -> str:
+    """Supprime les accents et met en minuscule pour comparaison robuste."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+
+
 def extraire_passages_nom(contenu: str, nom_complet: str) -> str:
     """Extrait les passages autour du nom avec mots-clés de fonction."""
     if not contenu or not nom_complet:
         return contenu or ""
 
-    nom_parts   = [p.lower() for p in nom_complet.split() if len(p) > 2]
+    # Normalisation accents — "Kaboré" → "kabore", "Gnassingbé" → "gnassingbe"
+    nom_parts   = [_normaliser(p) for p in nom_complet.split() if len(p) > 2]
     mots_fonction = [
-        'ministre', 'président', 'directeur', 'nommé', 'nomination',
-        'décret', 'secrétaire', 'ambassadeur', 'conseil des ministres',
+        'ministre', 'president', 'directeur', 'nomme', 'nomination',
+        'decret', 'secretaire', 'ambassadeur', 'conseil des ministres',
         'gouverneur', 'haut commissaire', 'premier ministre', 'chef',
         'minister', 'appointed', 'designated', 'named',
     ]
@@ -236,7 +259,8 @@ def extraire_passages_nom(contenu: str, nom_complet: str) -> str:
     passages = []
 
     for i, ligne in enumerate(lignes):
-        if any(p in ligne.lower() for p in nom_parts):
+        ligne_norm = _normaliser(ligne)
+        if any(p in ligne_norm for p in nom_parts):
             debut    = max(0, i - 3)
             fin      = min(len(lignes), i + 4)
             contexte = "\n".join(lignes[debut:fin])
@@ -245,10 +269,15 @@ def extraire_passages_nom(contenu: str, nom_complet: str) -> str:
     if not passages:
         return contenu[:2000]
 
-    avec_fonction = [p for p in passages if any(m in p.lower() for m in mots_fonction)]
+    avec_fonction = [p for p in passages if any(m in _normaliser(p) for m in mots_fonction)]
     selection     = avec_fonction if avec_fonction else passages
+    resultat      = "\n\n---\n\n".join(selection[:5])
 
-    return "\n\n---\n\n".join(selection[:5])
+    # Si trop peu de contenu extrait → compléter avec le début du corpus brut
+    if len(resultat.split()) < 300:
+        resultat += "\n\n---\n\n[CORPUS BRUT]\n" + contenu[:2000]
+
+    return resultat
 
 
 # ── TOOL 2 : Scrapling structuré — extraction JSON depuis pages officielles ─────
@@ -279,7 +308,7 @@ def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
     import requests
     from bs4 import BeautifulSoup
 
-    for url in urls[:4]:
+    for url in urls:
         if not est_source_officielle(url):
             continue
         try:
@@ -312,21 +341,43 @@ def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
                             nominations.append({"nom": nom_col, "fonction": fct_col, "source": url})
 
             # ── Extraction listes ──────────────────────────────────────────────
+            MOTS_FCT_SPLIT = [
+                "Président", "Premier ministre", "Prime Minister", "President",
+                "Ministre", "Minister", "Directeur", "Director",
+                "Gouverneur", "Governor", "Secrétaire", "Secretary",
+                "Chef ", "Ambassadeur", "Ambassador",
+            ]
             for li in soup.find_all(["li", "p", "div"]):
                 texte = li.get_text(strip=True)
-                if len(texte) < 5 or len(texte) > 300:
+                if len(texte) < 5 or len(texte) > 500:
                     continue
                 if any(p in texte.lower() for p in nom_parts):
-                    # Pattern "Nom, Fonction" ou "Nom : Fonction"
-                    match = re.split(r',\s*|:\s*|–\s*|-\s*', texte, maxsplit=1)
-                    if len(match) == 2:
+                    # Pattern "Nom, Fonction" ou "Nom : Fonction" ou "Nom\nFonction"
+                    match = re.split(r',\s*|:\s*|–\s*|-\s*|\n', texte, maxsplit=1)
+                    if len(match) == 2 and match[1].strip():
                         nominations.append({
                             "nom":      match[0].strip(),
                             "fonction": match[1].strip(),
                             "source":   url
                         })
                     else:
-                        nominations.append({"nom": texte, "fonction": "", "source": url})
+                        # Nom+fonction collés sans séparateur → chercher mot-clé de fonction
+                        fct_trouvee = ""
+                        idx_fct = -1
+                        for kw in MOTS_FCT_SPLIT:
+                            idx = texte.find(kw)
+                            if 0 < idx < len(texte) - 3:
+                                if idx_fct == -1 or idx < idx_fct:
+                                    idx_fct = idx
+                                    fct_trouvee = texte[idx:].strip()
+                        if fct_trouvee and idx_fct > 2:
+                            nominations.append({
+                                "nom":      texte[:idx_fct].strip(),
+                                "fonction": fct_trouvee[:120],
+                                "source":   url
+                            })
+                        else:
+                            nominations.append({"nom": texte, "fonction": "", "source": url})
 
             # ── Si page index (liste de Conseils des Ministres) → suivre liens ──
             texte_page = soup.get_text(separator="\n", strip=True)
@@ -402,12 +453,16 @@ def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
                     if any(p in (n.get("nom","") + n.get("fonction","")).lower()
                            for p in nom_parts)
                 ]
-                # Si aucune après filtre → garder toutes mais marquer
                 selection = nominations_filtrees if nominations_filtrees else nominations[:5]
+                # Continuer sur URL suivante si aucune entrée avec fonction
+                has_fonction = any(n.get("fonction","").strip() for n in selection)
+                if not has_fonction:
+                    print(f"  Scrapling {url[:50]} : nominations sans fonction → URL suivante...")
+                    continue
                 print(f"  Scrapling JSON : {len(selection)} entrées pertinentes (/{len(nominations)} total) depuis {url}")
                 return {
-                    "source":      url,
-                    "nominations": selection[:10],
+                    "source":         url,
+                    "nominations":    selection[:10],
                     "personne_cible": nom_complet,
                 }
 
@@ -425,7 +480,7 @@ def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
 
 # ── TOOL 1 : Tavily — recherche ciblée site: ────────────────────────────────────
 
-def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str):
+def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pep: str = "non précisée"):
     """
     Recherche autonome — l'agent trouve seul, sans qu'on lui dise où chercher.
 
@@ -449,7 +504,7 @@ def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str):
 
     for q in requetes_libres:
         try:
-            res = tavily.invoke({"query": q})
+            res = _tavily_invoke(tavily, q, f"libre: {q[:40]}")
             if res:
                 texte = str(res)
                 if any(p in texte.lower() for p in nom_parts):
@@ -465,7 +520,7 @@ def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str):
         sites_pays = DOMAINES_OFFICIELS_PAR_PAYS.get(code_iso.upper(), [])
         for site in sites_pays[:4]:
             try:
-                res = tavily.invoke({"query": f'site:{site} "{nom_complet}"'})
+                res = _tavily_invoke(tavily, f'site:{site} "{nom_complet}"', f"fallback: {site}")
                 if res:
                     texte = str(res)
                     if any(p in texte.lower() for p in nom_parts):
@@ -476,10 +531,24 @@ def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str):
             except Exception:
                 continue
 
+        # Requête historique — ex-PEP (renversés, démissionnaires, retraités)
+        # Toujours lancée si duree_ex_pep = "permanente" (obligation GAFI R12)
+        # Sinon seulement en fallback (peu de résultats au niveau 1)
+        if duree_ex_pep == "permanente" or len(urls_officielles) < 1:
+            try:
+                res = _tavily_invoke(tavily, f'"{nom_complet}" ancien OR ex-président OR ex-ministre OR renversé OR démission {pays_nom}', "historique ex-pep")
+                if res:
+                    texte = str(res)
+                    if any(p in texte.lower() for p in nom_parts):
+                        resultats_bruts.append(f"[HISTORIQUE EX-PEP]\n{texte}")
+            except Exception:
+                pass
+
     # Tier 2 — toujours interrogé (pas seulement en fallback)
+    # Pas de contrainte d'année — couvre aussi les ex-PEP (coups, démissions, retraites passées)
     for site in ["rfi.fr", "afp.com", "jeuneafrique.com", "reuters.com"]:
         try:
-            res = tavily.invoke({"query": f'site:{site} "{nom_complet}" {annee} OR {annee-1}'})
+            res = _tavily_invoke(tavily, f'site:{site} "{nom_complet}" fonction OR président OR ministre OR ancien', f"media: {site}")
             if res:
                 texte = str(res)
                 if any(p in texte.lower() for p in nom_parts):
@@ -496,83 +565,319 @@ def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str):
     return extrait, list(set(urls_officielles))
 
 
+# ── TIER 2b : Google Custom Search — complément Tavily ─────────────────────────
+
+def rechercher_google(nom_complet: str, pays_nom: str, code_iso: str) -> tuple[str, list[str]]:
+    """
+    Serper.dev (Google Search) — Tier 2 complémentaire à Tavily.
+    Nécessite serper_dev_aoi_key dans .env. 2500 requêtes/mois gratuites.
+    Retourne (texte_corpus_annoté, urls_officielles)
+    """
+    import os, requests as req_g
+    api_key = os.getenv("serper_dev_aoi_key", "")
+    if not api_key:
+        print(f"  [Tier 2b] Serper — clé manquante → ignoré")
+        return "", []
+
+    nom_parts = [p.lower() for p in nom_complet.split() if len(p) > 2]
+
+    # Requêtes principales (fonction/statut) + 1 requête dédiée aux dates de nomination
+    requetes_principales = [
+        f'"{nom_complet}" président OR ministre {pays_nom}',
+        f'"{nom_complet}" ancien président OR ex-président {pays_nom}',
+    ]
+    requete_date = f'"{nom_complet}" élu OR investi OR nommé OR "prise de fonctions"'
+
+    resultats_bruts  = []
+    urls_officielles = []
+
+    # Requêtes principales — break après la 1ère réussie
+    for q in requetes_principales:
+        try:
+            r = req_g.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                json={"q": q, "hl": "fr", "num": 10},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                print(f"  [Tier 2b] Serper HTTP {r.status_code}")
+                continue
+            items = r.json().get("organic", [])
+            if not items:
+                continue
+
+            parties_q = []
+            for item in items:
+                url     = item.get("link", "")
+                titre   = item.get("title", "")
+                snippet = item.get("snippet", "")
+                texte   = f"{url}\n{titre}\n{snippet}"
+                if any(p in texte.lower() for p in nom_parts):
+                    parties_q.append(texte)
+                    if est_source_officielle(url):
+                        urls_officielles.append(url)
+
+            if parties_q:
+                resultats_bruts.append("[SERPER/GOOGLE]\n" + "\n\n".join(parties_q))
+                break
+        except Exception as e:
+            print(f"  [Tier 2b] Serper erreur : {e}")
+            continue
+
+    # Requête dédiée aux dates — toujours exécutée, résultats ajoutés au corpus
+    try:
+        r_date = req_g.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": requete_date, "hl": "fr", "num": 10},
+            timeout=8,
+        )
+        if r_date.status_code == 200:
+            items_date = r_date.json().get("organic", [])
+            parties_date = []
+            for item in items_date:
+                url     = item.get("link", "")
+                titre   = item.get("title", "")
+                snippet = item.get("snippet", "")
+                texte   = f"{url}\n{titre}\n{snippet}"
+                if any(p in texte.lower() for p in nom_parts):
+                    parties_date.append(texte)
+            if parties_date:
+                resultats_bruts.append("[SERPER/DATE]\n" + "\n\n".join(parties_date))
+    except Exception:
+        pass
+
+    if not resultats_bruts:
+        print(f"  [Tier 2b] Serper — 0 résultat pertinent")
+        return "", []
+
+    brut    = "\n\n".join(resultats_bruts)
+    filtre  = filtrer_resultats(brut)
+    annote  = annoter_sources(filtre)
+    extrait = extraire_passages_nom(annote, nom_complet)
+
+    nb_off = len(urls_officielles)
+    print(f"  [Tier 2b] Serper — {len(extrait.split())} mots | {nb_off} URLs off")
+    return extrait, list(set(urls_officielles))
+
+
+# ── TIER 3 : OpenSanctions — base mondiale PEP/sanctions ────────────────────────
+
+_opensanctions_last_call: float = 0.0
+_OPENSANCTIONS_MIN_INTERVAL = 30.0  # secondes minimum entre deux appels (quota 2000 req/mois)
+
+def rechercher_opensanctions(nom_complet: str, code_iso: str = "") -> dict:
+    """
+    Interroge l'API OpenSanctions avec clé API.
+    Retourne les entités PEP/sanctions trouvées pour ce nom.
+    Throttling global : min 6s entre appels (limite API gratuite).
+    Retry automatique sur 429 : 3 tentatives, backoff exponentiel 1s→2s→4s.
+    """
+    global _opensanctions_last_call
+    import os, time, requests as req_os
+
+    # Throttling — attendre si dernier appel trop récent
+    elapsed = time.time() - _opensanctions_last_call
+    if elapsed < _OPENSANCTIONS_MIN_INTERVAL:
+        attente = _OPENSANCTIONS_MIN_INTERVAL - elapsed
+        print(f"  [Tier 3] OpenSanctions throttle — attente {attente:.1f}s")
+        time.sleep(attente)
+    _opensanctions_last_call = time.time()
+    api_key = os.getenv("open_sanction_apikey", "")
+    nom_parts = [p.lower() for p in nom_complet.split() if len(p) > 2]
+    try:
+        params = {"q": nom_complet, "limit": 10, "fuzzy": "true"}
+        if code_iso and code_iso != "XX":
+            params["countries"] = code_iso.lower()
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"ApiKey {api_key}"
+
+        r = None
+        for tentative in range(3):
+            r = req_os.get(
+                "https://api.opensanctions.org/search/default",
+                params=params,
+                timeout=10,
+                headers=headers,
+            )
+            if r.status_code == 429:
+                delai = 2 ** tentative  # 1s, 2s, 4s
+                print(f"  [Tier 3] OpenSanctions 429 — attente {delai}s (tentative {tentative+1}/3)")
+                time.sleep(delai)
+                continue
+            break
+
+        if r is None or r.status_code != 200:
+            print(f"  [Tier 3] OpenSanctions HTTP {r.status_code if r else '?'}")
+            return {}
+        data = r.json()
+        resultats = data.get("results", [])
+        if not resultats:
+            print(f"  [Tier 3] OpenSanctions — 0 résultat pour {nom_complet}")
+            return {}
+
+        FONCTIONS_PEP = [
+            "president", "premier ministre", "prime minister", "ministre",
+            "minister", "gouverneur", "governor", "directeur général",
+            "secrétaire général", "chef", "ambassadeur", "ambassador",
+            "chairman", "chairperson", "member of", "conseil",
+        ]
+        entites_pep = []
+        for ent in resultats:
+            props  = ent.get("properties", {})
+            topics = ent.get("topics", [])
+            nom_ent = " ".join(props.get("name", []) + props.get("alias", []))
+            if not any(p in nom_ent.lower() for p in nom_parts):
+                continue
+            fonctions = props.get("position", props.get("role", []))
+            # Détecter PEP via topics OU via fonctions (OpenSanctions met souvent topics=[])
+            is_pep_topics = "pep" in topics or "role.pep" in topics
+            is_pep_fcts   = any(
+                any(kw in f.lower() for kw in FONCTIONS_PEP)
+                for f in fonctions
+            )
+            # Extraire date de début de fonction (startDate ou date — pas birthDate)
+            date_debut_raw = props.get("startDate", props.get("positionStart", []))
+            date_debut = date_debut_raw[0] if date_debut_raw else None
+            entite = {
+                "nom":        " ".join(props.get("name", [nom_complet])),
+                "pays":       props.get("country", [code_iso]),
+                "fonctions":  fonctions,
+                "topics":     topics,
+                "is_pep":     is_pep_topics or is_pep_fcts,
+                "sanctions":  "sanction" in topics,
+                "source":     ent.get("id", ""),
+                "date_debut": date_debut,
+            }
+            entites_pep.append(entite)
+
+        if entites_pep:
+            nb_pep = sum(1 for e in entites_pep if e["is_pep"])
+            print(f"  [Tier 3] OpenSanctions — {len(entites_pep)} entités ({nb_pep} PEP) pour {nom_complet}")
+            return {"entites": entites_pep, "source": "opensanctions.org"}
+        else:
+            print(f"  [Tier 3] OpenSanctions — 0 entité correspondante pour {nom_complet}")
+            return {}
+    except Exception as e:
+        print(f"  [Tier 3] OpenSanctions erreur : {e}")
+        return {}
+
+
 # ── Interface principale ─────────────────────────────────────────────────────────
 
-def rechercher_pep(nom_complet: str, pays_nom: str, code_iso: str) -> str:
+def rechercher_pep(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pep: str = "non précisée") -> str:
     """
-    Recherche complète en 3 étapes :
-    1. Tavily → cherche et extrait passages ciblés
-    2. Scrapling → extrait JSON structuré depuis URLs officielles
-    3. Fallback → sites gouvernementaux prédéfinis
+    Recherche 3 tiers en parallèle :
+      Tier 1 — Scrapling direct (sites officiels connus + URLs trouvées par Tavily)
+      Tier 2 — Tavily (recherche web libre + médias)
+      Tier 3 — OpenSanctions (base PEP/sanctions mondiale)
+    Tavily tourne en thread principal (counter non thread-safe).
+    Scrapling + OpenSanctions tournent en parallèle dans des threads séparés.
     """
-    # ── Collecte parallèle toutes sources ────────────────────────────────────────
-    print(f"\n  [Tool 1] Tavily libre + prédéfini...")
-    resultats_tavily, urls_officielles = recherche_tavily(nom_complet, pays_nom, code_iso)
-    print(f"  → {len(urls_officielles)} URLs officielles | {len(resultats_tavily.split())} mots")
+    # ── Tier 2 : Tavily — thread principal ───────────────────────────────────────
+    print(f"\n  [Tier 2] Tavily — recherche web libre + médias...")
+    resultats_tavily, urls_tavily = recherche_tavily(nom_complet, pays_nom, code_iso, duree_ex_pep)
+    print(f"  → {len(urls_tavily)} URLs officielles Tavily | {len(resultats_tavily.split())} mots")
 
-    # Tool 2 : Scrapling JSON structuré
-    contenu_json = {}
-    if urls_officielles:
-        print(f"  [Tool 2] Scrapling JSON sur {min(4, len(urls_officielles))} URLs...")
-        contenu_json = scraper_json_officiel(nom_complet, urls_officielles)
-
-    # Tool 3 : Wikipedia — contenu + liens officiels (poids faible)
-    print(f"  [Tool 3] Wikipedia — corpus + liens officiels...")
-    res_wiki   = tavily.invoke({"query": f'site:wikipedia.org "{nom_complet}"'})
+    # Wikipedia via Tavily — thread principal
+    print(f"  [Tier 2+] Wikipedia — corpus + liens officiels...")
+    res_wiki   = _tavily_invoke(tavily, f'site:wikipedia.org "{nom_complet}"', "Wikipedia corpus")
     texte_wiki = filtrer_resultats(str(res_wiki)) if res_wiki else ""
+    extrait_wiki = ""
     if texte_wiki and any(p in texte_wiki.lower() for p in [n.lower() for n in nom_complet.split() if len(n)>2]):
         extrait_wiki = extraire_passages_nom(texte_wiki, nom_complet)
-    else:
-        extrait_wiki = ""
+    liens_wiki = extraire_liens_officiels_wikipedia(nom_complet)
 
-    liens_wiki       = extraire_liens_officiels_wikipedia(nom_complet)
+    # ── Tier 2b : Google Custom Search — thread principal ────────────────────────
+    print(f"  [Tier 2b] Google — recherche web complémentaire...")
+    resultats_google, urls_google = rechercher_google(nom_complet, pays_nom, code_iso)
+
+    # ── Tier 1 + Tier 3 : Scrapling & OpenSanctions — en parallèle ──────────────
+    urls_pays     = [f"https://{d}" for d in DOMAINES_OFFICIELS_PAR_PAYS.get(code_iso.upper(), [])]
+    urls_scraping = list(dict.fromkeys(urls_pays + urls_tavily + urls_google))  # pays en priorité, pas de doublon
+
+    contenu_json  = {}
     contenu_wiki_off = {}
-    if liens_wiki:
-        contenu_wiki_off = scraper_json_officiel(nom_complet, liens_wiki)
+    os_result     = {}
 
-    # ── Construction corpus de comparaison ───────────────────────────────────────
+    def _run_scrapling():
+        if not urls_scraping:
+            return {}
+        print(f"  [Tier 1] Scrapling — {len(urls_scraping)} URLs (pays:{len(urls_pays)} + Tavily:{len(urls_tavily)})...")
+        return scraper_json_officiel(nom_complet, urls_scraping)
+
+    def _run_wiki_scraping():
+        if not liens_wiki:
+            return {}
+        return scraper_json_officiel(nom_complet, liens_wiki)
+
+    def _run_opensanctions():
+        print(f"  [Tier 3] OpenSanctions — recherche {nom_complet}...")
+        return rechercher_opensanctions(nom_complet, code_iso)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_scraping = pool.submit(_run_scrapling)
+        f_wiki_off = pool.submit(_run_wiki_scraping)
+        f_os       = pool.submit(_run_opensanctions)
+        try:
+            contenu_json     = f_scraping.result(timeout=45)
+        except Exception as e:
+            print(f"  [Tier 1] Scrapling timeout : {e}")
+        try:
+            contenu_wiki_off = f_wiki_off.result(timeout=20)
+        except Exception:
+            pass
+        try:
+            os_result        = f_os.result(timeout=15)
+        except Exception as e:
+            print(f"  [Tier 3] OpenSanctions timeout : {e}")
+
+    # ── Construction corpus unifié — Tier 1 + Tier 2 + Tier 3 ───────────────────
     parties = []
 
-    # Source prioritaire : données JSON officielles
+    # Tier 1 — Scrapling (source officielle directe, poids maximal)
     if contenu_json.get("nominations"):
         parties.append(
-            f"=== SOURCE OFFICIELLE DIRECTE (JSON) — {contenu_json['source']} ===\n"
+            f"=== TIER 1 — SCRAPLING OFFICIEL [OFFICIEL✅] — {contenu_json['source']} ===\n"
             + json.dumps(contenu_json["nominations"], ensure_ascii=False, indent=2)
         )
+        texte_brut_nom = "\n".join(
+            f"{n.get('nom','')} {n.get('fonction','')}".strip()
+            for n in contenu_json["nominations"] if n.get("nom")
+        )
+        if texte_brut_nom.strip():
+            parties.append(f"=== TIER 1 — SCRAPLING CORPUS BRUT [OFFICIEL✅] ===\n{texte_brut_nom}")
     elif contenu_json.get("texte_brut"):
-        parties.append(f"=== SOURCE OFFICIELLE (texte) — {contenu_json['source']} ===\n{contenu_json['texte_brut']}")
+        parties.append(f"=== TIER 1 — SCRAPLING OFFICIEL (texte) [OFFICIEL✅] — {contenu_json['source']} ===\n{contenu_json['texte_brut']}")
 
-    # Tavily — passages officiels
+    # Tier 2 — Tavily (recherche web)
     if resultats_tavily.strip():
-        parties.append(f"=== TAVILY — SOURCES OFFICIELLES ===\n{resultats_tavily}")
+        parties.append(f"=== TIER 2 — TAVILY RECHERCHE WEB ===\n{resultats_tavily}")
 
-    # Wikipedia — contenu biographique (poids faible [WIKI🔍])
+    # Tier 2b — Google Custom Search
+    if resultats_google.strip():
+        parties.append(f"=== TIER 2b — GOOGLE SEARCH ===\n{resultats_google}")
+
+    # Tier 2+ — Wikipedia
     if extrait_wiki:
-        parties.append(f"=== WIKIPEDIA [WIKI🔍] ===\n{extrait_wiki[:800]}")
-
-    # Liens officiels trouvés via Wikipedia
+        parties.append(f"=== TIER 2 — WIKIPEDIA [WIKI🔍] ===\n{extrait_wiki[:800]}")
     if contenu_wiki_off.get("nominations"):
         parties.append(
-            f"=== VIA WIKIPEDIA → SOURCE OFFICIELLE [OFFICIEL✅] — {contenu_wiki_off['source']} ===\n"
+            f"=== TIER 2 — VIA WIKIPEDIA → OFFICIEL [OFFICIEL✅] — {contenu_wiki_off['source']} ===\n"
             + json.dumps(contenu_wiki_off["nominations"], ensure_ascii=False, indent=2)
         )
     elif contenu_wiki_off.get("texte_brut"):
-        parties.append(f"=== VIA WIKIPEDIA → SOURCE OFFICIELLE [OFFICIEL✅] ===\n{contenu_wiki_off['texte_brut']}")
+        parties.append(f"=== TIER 2 — VIA WIKIPEDIA → OFFICIEL [OFFICIEL✅] ===\n{contenu_wiki_off['texte_brut']}")
+
+    # Tier 3 — OpenSanctions (complément compliance)
+    if os_result.get("entites"):
+        entites_str = json.dumps(os_result["entites"], ensure_ascii=False, indent=2)
+        parties.append(f"=== TIER 3 — OPENSANCTIONS [COMPLIANCE✅] ===\n{entites_str}")
 
     if not parties:
-        # Fallback gouvernemental si aucune source n'a rien retourné
-        print(f"  [Fallback] Sites gouvernementaux prédéfinis...")
-        urls_fb = URLS_GOUVERNEMENTALES.get(code_iso.upper(), [])
-        fb      = scraper_json_officiel(nom_complet, urls_fb)
-        if fb.get("nominations"):
-            parties.append(
-                f"=== FALLBACK GOUVERNEMENTAL (JSON) ===\n"
-                + json.dumps(fb["nominations"], ensure_ascii=False, indent=2)
-            )
-        elif fb.get("texte_brut"):
-            parties.append(f"=== FALLBACK (texte) ===\n{fb['texte_brut']}")
-        else:
-            parties.append("Aucun résultat trouvé sur les sources officielles.")
+        parties.append("Aucun résultat trouvé sur les sources Tier 1/2/3.")
 
     return "\n\n".join(parties)
 
@@ -603,7 +908,7 @@ def consensus_sources(nom_complet: str, pays_nom: str, code_iso: str,
     for site in sites_pays[:6]:
         q = f'site:{site} "{nom_complet}" {annee} OR {annee-1}'
         try:
-            res = tavily.invoke({"query": q})
+            res = _tavily_invoke(tavily, q, f"consensus: {site}")
             if not res:
                 continue
             texte = str(res)
