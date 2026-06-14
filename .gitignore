@@ -25,3 +25,15 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Logs runtime
+*.log
+*_log.txt
+*_err.txt
+collector_pid.txt
+
+# Données runtime / checkpoints
+verification_checkpoint.json
+collector_status.json
+gafi_pending.json
+gafi_rapport.json

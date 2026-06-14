@@ -48,6 +48,50 @@ with st.form("pep_form"):
 
 if submitted and prenom and nom:
     st.divider()
+
+    # ── Vérification base de données en premier ──────────────────────────────────
+    from dotenv import load_dotenv as _ldenv; _ldenv(override=True)
+    from db_utils import query_one as _qone
+    nom_complet_recherche = f"{prenom} {nom}".strip()
+    existant = _qone("""
+        SELECT nom_complete, pays_nom, code_iso, fonction_actuelle,
+               statut_mandat, source_url, date_nomination, date_creation
+        FROM pep
+        WHERE nom_complete ILIKE %s OR nom_complete ILIKE %s
+        LIMIT 1
+    """, (nom_complet_recherche, f"{nom} {prenom}"))
+
+    if existant and not st.session_state.get(f"forcer_maj_{nom_complet_recherche}"):
+        from datetime import date as _date
+        date_verif = existant["date_creation"]
+        jours_depuis = (datetime.now().date() - date_verif.date()).days if date_verif else 999
+
+        if jours_depuis <= 30:
+            fraicheur_label = f"🟢 Récent ({jours_depuis}j)"
+        elif jours_depuis <= 90:
+            fraicheur_label = f"🟡 Modéré ({jours_depuis}j)"
+        else:
+            fraicheur_label = f"🔴 Ancien ({jours_depuis}j) — mise à jour recommandée"
+
+        st.success("✅ Personne déjà connue dans la base PEP")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("Personne", existant["nom_complete"])
+            st.metric("Pays", f"{existant['pays_nom']} ({existant['code_iso']})")
+            st.metric("Statut", existant["statut_mandat"] or "—")
+        with col_b:
+            st.metric("Fonction", (existant["fonction_actuelle"] or "—")[:60])
+            st.metric("Date nomination", str(existant["date_nomination"] or "—"))
+            st.metric("Dernière vérification", fraicheur_label)
+        if existant["source_url"]:
+            st.markdown(f"**Source :** [{existant['source_url']}]({existant['source_url']})")
+
+        st.warning("⚠️ Les informations peuvent avoir changé (nouvelle fonction, fin de mandat…)")
+        if st.button("🔄 Relancer une vérification complète (mise à jour)", type="secondary"):
+            st.session_state[f"forcer_maj_{nom_complet_recherche}"] = True
+            st.rerun()
+        st.stop()
+
     col_steps, col_result = st.columns([1, 1])
 
     with col_steps:
