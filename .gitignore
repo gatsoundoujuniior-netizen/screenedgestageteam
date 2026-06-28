@@ -1,0 +1,18 @@
+# Credentials & secrets
+ssh root 195 200 14.txt
+*.env
+.env*
+secrets.*
+
+# Fichiers temporaires Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

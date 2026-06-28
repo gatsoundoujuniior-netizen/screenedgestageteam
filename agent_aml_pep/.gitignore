@@ -1,0 +1,49 @@
+# Secrets — NE JAMAIS COMMITTER
+.env
+
+# Environnement virtuel
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs runtime
+*.log
+*_log.txt
+*_err.txt
+collector_pid.txt
+
+# Données runtime / checkpoints
+verification_checkpoint.json
+collector_status.json
+gafi_pending.json
+gafi_rapport.json
+api_usage.json
+discovered_urls_cache.json
+opensanctions_meta.json
+
+# Dump OpenSanctions (fichier lourd, régénéré automatiquement)
+*.sqlite
+os_pep_tmp.csv
+
+# Script admin VPS (contient credentials)
+_vps_clean.py
