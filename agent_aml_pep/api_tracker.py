@@ -139,16 +139,15 @@ def quota_restant_verifications() -> dict:
     Le facteur limitant est le min(tavily, groq).
     """
     data  = _charger()
-    today = datetime.now().strftime("%Y-%m-%d")
 
     tav       = data.get("tavily", {})
-    t_utilise = tav.get("appels", 0) if tav.get("date") == today else 0
+    t_utilise = tav.get("appels", 0)
     t_limite  = LIMITES["tavily_appels_jour"]
     t_restant = max(0, t_limite - t_utilise)
     verifs_tavily = t_restant // TAVILY_APPELS_PAR_VERIF
 
     g1        = data.get("groq_1", {})
-    g_utilise = g1.get("appels", 0) if g1.get("date") == today else 0
+    g_utilise = g1.get("appels", 0)
     g_limite  = LIMITES["groq_1_appels_jour"]
     g_restant = max(0, g_limite - g_utilise)
     verifs_groq = g_restant // GROQ_APPELS_PAR_VERIF
@@ -177,25 +176,24 @@ def quota_restant_verifications() -> dict:
 
 
 def lire_consommation() -> dict:
-    """Retourne la consommation actuelle avec pourcentages (pour le dashboard)."""
-    data  = _charger()
-    today = datetime.now().strftime("%Y-%m-%d")
-    mois  = datetime.now().strftime("%Y-%m")
+    """Retourne la consommation réelle depuis api_usage.json sans filtrage par date."""
+    data = _charger()
 
     def _pct(used, limit):
         return round(used / limit * 100, 1) if limit else 0
 
     def _groq_bloc(n):
-        b = data.get(f"groq_{n}", {})
-        appels = b.get("appels", 0) if b.get("date") == today else 0
+        b      = data.get(f"groq_{n}", {})
+        appels = b.get("appels", 0)
         limite = LIMITES[f"groq_{n}_appels_jour"]
+        date   = b.get("date", "—")
         return {
             "label":   f"Groq-{n} (llama-4-scout) — req/jour",
             "utilise": appels,
             "appels":  appels,
             "limite":  limite,
             "pct":     _pct(appels, limite),
-            "periode": "aujourd'hui",
+            "periode": date,
         }
 
     gem   = data.get("gemini", {})
@@ -203,11 +201,11 @@ def lire_consommation() -> dict:
     tav   = data.get("tavily", {})
     osanc = data.get("opensanctions", {})
 
-    gm_tokens = gem.get("tokens", 0)  if gem.get("date")  == today else 0
-    gm_appels = gem.get("appels", 0)  if gem.get("date")  == today else 0
-    s_appels  = serp.get("appels", 0) if serp.get("mois") == mois  else 0
-    t_appels  = tav.get("appels", 0)  if tav.get("date")  == today else 0
-    o_appels  = osanc.get("appels", 0) if osanc.get("mois") == mois else 0
+    gm_tokens = gem.get("tokens", 0)
+    gm_appels = gem.get("appels", 0)
+    s_appels  = serp.get("appels", 0)
+    t_appels  = tav.get("appels", 0)
+    o_appels  = osanc.get("appels", 0)
 
     return {
         "groq_1":        _groq_bloc(1),
@@ -219,7 +217,7 @@ def lire_consommation() -> dict:
             "appels":  gm_appels,
             "limite":  LIMITES["gemini_tokens_jour"],
             "pct":     _pct(gm_tokens, LIMITES["gemini_tokens_jour"]),
-            "periode": "aujourd'hui",
+            "periode": gem.get("date", "—"),
         },
         "serper": {
             "label":   "Serper — requêtes/mois",
@@ -227,7 +225,7 @@ def lire_consommation() -> dict:
             "appels":  s_appels,
             "limite":  LIMITES["serper_appels_mois"],
             "pct":     _pct(s_appels, LIMITES["serper_appels_mois"]),
-            "periode": "ce mois",
+            "periode": serp.get("mois", "—"),
         },
         "tavily": {
             "label":   "Tavily — requêtes/jour",
@@ -235,7 +233,7 @@ def lire_consommation() -> dict:
             "appels":  t_appels,
             "limite":  LIMITES["tavily_appels_jour"],
             "pct":     _pct(t_appels, LIMITES["tavily_appels_jour"]),
-            "periode": "aujourd'hui",
+            "periode": tav.get("date", "—"),
         },
         "opensanctions": {
             "label":   "OpenSanctions — requêtes/mois",
@@ -243,6 +241,6 @@ def lire_consommation() -> dict:
             "appels":  o_appels,
             "limite":  LIMITES["opensanctions_appels_mois"],
             "pct":     _pct(o_appels, LIMITES["opensanctions_appels_mois"]),
-            "periode": "ce mois",
+            "periode": osanc.get("mois", "—"),
         },
     }
