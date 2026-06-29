@@ -49,6 +49,7 @@ _status: dict = {
     "countries_total": len(PAYS_PERIMETRE),
     "errors":          [],
     "last_update":     "",
+    "llm_actif":       "",
 }
 
 
@@ -1305,6 +1306,12 @@ def pipeline_lot(lot: list[dict], code_iso: str, pays_nom: str,
                        inserted_last=0)
         try:
             rapport = verifier_pep(prenom, nom)
+            # Capturer le modèle LLM utilisé pour affichage live dans le dashboard
+            try:
+                import pep_agent as _pa
+                _status["llm_actif"] = _pa._audit_llm.get("modele", "")
+            except Exception:
+                pass
             if _cpt is not None:
                 _cpt[0] += 1
                 _status["verif_total"] = _cpt[0]

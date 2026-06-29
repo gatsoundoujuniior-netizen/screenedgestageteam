@@ -411,15 +411,18 @@ _api_usage = _charger_api_usage()
 
 if _api_usage:
     _api_cols = st.columns(5)
+    # Modèle LLM actif (lu depuis collector_status.json)
+    _llm_actif = statut.get("llm_actif", "") if statut else ""
+
     _api_cfg = [
-        ("gemini",        "✨ Gemini",         "#2ecc71"),
-        ("groq_1",        "🤖 Groq",             "#3498db"),
-        ("serper",        "🔍 Serper",          "#9b59b6"),
-        ("tavily",        "🌐 Tavily",          "#1abc9c"),
-        ("opensanctions", "🛡️ OpenSanctions",  "#e67e22"),
+        ("gemini",        "✨ Gemini",          "gemini-2.5-flash"),
+        ("groq_1",        "🤖 Groq",            "llama-4-scout"),
+        ("serper",        "🔍 Serper",          ""),
+        ("tavily",        "🌐 Tavily",          ""),
+        ("opensanctions", "🛡️ OpenSanctions",  ""),
     ]
 
-    for _col, (_key, _lbl, _color) in zip(_api_cols, _api_cfg):
+    for _col, (_key, _lbl, _model_name) in zip(_api_cols, _api_cfg):
         _d = _api_usage.get(_key, {})
         _pct  = _d.get("pct", 0)
         _util = _d.get("utilise", 0)
@@ -429,19 +432,26 @@ if _api_usage:
 
         if _pct >= 100:
             _badge = "🔴 ÉPUISÉ"
-            _bar_color = "red"
         elif _pct >= 95:
             _badge = "⛔ CRITIQUE"
-            _bar_color = "red"
         elif _pct >= 80:
             _badge = "⚠️ ALERTE"
-            _bar_color = "orange"
         else:
             _badge = "✅ OK"
-            _bar_color = "green"
+
+        # Indicateur modèle actif
+        _actif_tag = ""
+        if _model_name and _llm_actif and _model_name.lower() in _llm_actif.lower():
+            _actif_tag = " 🟢 **actif**"
+        elif _key == "groq_1" and _llm_actif and "groq" in _llm_actif.lower():
+            _actif_tag = " 🟢 **actif**"
+        elif _key == "gemini" and _llm_actif and "gemini" in _llm_actif.lower():
+            _actif_tag = " 🟡 **fallback actif**"
 
         with _col:
-            st.markdown(f"**{_lbl}** &nbsp; {_badge}")
+            st.markdown(f"**{_lbl}** &nbsp; {_badge}{_actif_tag}")
+            if _model_name:
+                st.caption(f"_{_model_name}_")
             st.progress(min(_pct / 100, 1.0))
             if _key == "gemini":
                 st.caption(f"{_util:,} tokens / {_lim:,} {_per} ({_pct}%)")
