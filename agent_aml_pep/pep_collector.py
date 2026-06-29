@@ -7,7 +7,6 @@ Track A : OpenSanctions + Tavily + Serper → découverte noms → verifier_pep 
 
 Lancer :
   python pep_collector.py                    # les deux tracks, 13 pays
-  python pep_collector.py --track-b-only     # Track B uniquement
   python pep_collector.py --pays MA,SN,CI    # pays sélectionnés
 """
 
@@ -955,6 +954,33 @@ def _inserer_direct(p: dict, code_iso: str, pays_nom: str, source_url: str) -> b
                 datetime.now().year,
             ),
         )
+        # Audit obligatoire — traçabilité compliance pour tout INSERT
+        try:
+            execute("""
+                INSERT INTO verification_audit (
+                    ts, nom_complet, code_iso,
+                    opensanctions,
+                    llm_modele, llm_prompt, llm_reponse,
+                    est_pep, motif,
+                    duree_ms, tavily_appels, os_appels
+                ) VALUES (
+                    NOW(), %s, %s,
+                    %s::jsonb,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s
+                )
+            """, (
+                nom_complete, code_iso,
+                json.dumps({"confirmed": False, "source": source_url}),
+                "track_b_official_source",
+                "", "",
+                True,
+                f"Scraping direct du site officiel : {source_url[:300]}",
+                0, 0, 0,
+            ))
+        except Exception as _ae:
+            print(f"  [Audit] Erreur log Track B {nom_complete} : {_ae}")
         return True
     except Exception as e:
         print(f"  ⚠️  INSERT {nom_complete} : {e}")
@@ -1601,7 +1627,6 @@ def collecter_track_a(code_iso: str, pays_nom: str,
 # ── Point d'entrée principal ─────────────────────────────────────────────────────
 
 def alimenter_base_pep(pays_list: Optional[list] = None,
-                       track_b_only: bool = False,
                        max_verif: int = 0) -> None:
     """
     Pipeline par pays :
@@ -1613,7 +1638,7 @@ def alimenter_base_pep(pays_list: Optional[list] = None,
     ref    = _charger_referentiel()
     _cpt   = [0]  # compteur partagé de vérifications (mutable)
 
-    checkpoint = _charger_checkpoint() if not track_b_only else set()
+    checkpoint = _charger_checkpoint()
 
     _update_status(
         running=True,
@@ -1625,11 +1650,10 @@ def alimenter_base_pep(pays_list: Optional[list] = None,
 
     print(f"\n{'='*60}")
     print(f"ScreenEdge — Collecte PEP : {len(cibles)} pays")
-    print(f"Mode : {'B uniquement (INSERT direct)' if track_b_only else 'B+A (vérification avant INSERT)'}")
+    print(f"Mode : B+A (vérification pipeline complète avant INSERT)")
     if max_verif:
         print(f"Limite : {max_verif} vérifications max cette session")
-    if not track_b_only:
-        print(f"Checkpoint : {len(checkpoint)} PEP déjà vérifiés")
+    print(f"Checkpoint : {len(checkpoint)} PEP déjà vérifiés")
     print(f"{'='*60}")
 
     try:
@@ -1659,27 +1683,15 @@ def alimenter_base_pep(pays_list: Optional[list] = None,
                 lot_brut.extend(dump_nouveaux)
                 print(f"  [Dump 0b] {len(dump_nouveaux)} candidats ajoutés depuis OpenSanctions dump")
 
-            if track_b_only:
-                # Mode rapide : INSERT direct sans vérification
-                n = 0
-                for p in lot_brut:
-                    ok = _inserer_direct(p, code_iso, pays_nom, p.get("_source_url", ""))
-                    if ok:
-                        n += 1
-                        _status["inserted_total"] += 1
-                        _status["inserted_last"]   = 1
-                        _update_status()
-                print(f"  Track B (direct) : {n} PEP insérés")
+            # Pipeline B+A : Track B scrape → verifier_pep → INSERT si confirmé
+            if lot_brut:
+                n, checkpoint = pipeline_lot(
+                    lot_brut, code_iso, pays_nom, checkpoint, throttle_s=5,
+                    max_verif=max_verif, _cpt=_cpt
+                )
+                print(f"  Pipeline B+A : {n} PEP vérifiés et insérés")
             else:
-                # Mode B+A : Track B scrape → pipeline_lot → puis Track A en complément
-                if lot_brut:
-                    n, checkpoint = pipeline_lot(
-                        lot_brut, code_iso, pays_nom, checkpoint, throttle_s=5,
-                        max_verif=max_verif, _cpt=_cpt
-                    )
-                    print(f"  Pipeline B+A : {n} PEP vérifiés et insérés")
-                else:
-                    print(f"  Aucun candidat Track B pour {code_iso} — Track A seul")
+                print(f"  Aucun candidat Track B pour {code_iso} — Track A seul")
 
                 # Track A : découverte complémentaire (OpenSanctions + Tavily + Serper)
                 if not (max_verif and _cpt[0] >= max_verif):
@@ -1713,8 +1725,6 @@ def alimenter_base_pep(pays_list: Optional[list] = None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collecteur PEP ScreenEdge Africa")
-    parser.add_argument("--track-b-only", action="store_true",
-                        help="Lancer uniquement le Track B (sites officiels)")
     parser.add_argument("--pays", type=str, default="",
                         help="Liste de codes ISO séparés par virgule, ex: MA,SN,CI")
     parser.add_argument("--max-verif", type=int, default=0,
@@ -1723,5 +1733,4 @@ if __name__ == "__main__":
 
     pays_list = [p.strip().upper() for p in args.pays.split(",") if p.strip()] or None
 
-    alimenter_base_pep(pays_list=pays_list, track_b_only=args.track_b_only,
-                       max_verif=args.max_verif)
+    alimenter_base_pep(pays_list=pays_list, max_verif=args.max_verif)

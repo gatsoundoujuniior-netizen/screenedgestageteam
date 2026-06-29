@@ -412,7 +412,14 @@ _api_usage = _charger_api_usage()
 if _api_usage:
     _api_cols = st.columns(5)
     # Modèle LLM actif (lu depuis collector_status.json)
-    _llm_actif = statut.get("llm_actif", "") if statut else ""
+    _llm_actif = ""
+    try:
+        _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "collector_status.json")
+        if os.path.exists(_sp):
+            with open(_sp, "r", encoding="utf-8") as _sf:
+                _llm_actif = json.load(_sf).get("llm_actif", "")
+    except Exception:
+        pass
 
     _api_cfg = [
         ("gemini",        "✨ Gemini",          "gemini-2.5-flash"),
@@ -504,6 +511,81 @@ if _api_usage:
 
 else:
     st.info("Aucune donnée de consommation disponible — lancer l'agent pour commencer le suivi.")
+
+# ── Section : Couverture dump OpenSanctions ──────────────────────────────────────
+st.markdown("---")
+st.subheader("🗄️ Couverture dump OpenSanctions vs base")
+
+@st.cache_data(ttl=60)
+def _charger_stats_couverture():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from db_utils import query_all
+        from opensanctions_local import stats_par_pays, statut_dump
+
+        _PAYS_COV = ["MA", "DZ", "TN", "LY", "SN", "CI", "ML", "BF", "NE", "TG", "BJ", "GW", "GN"]
+        dump_stats = stats_par_pays(_PAYS_COV)
+
+        rows_v = query_all("SELECT code_iso, COUNT(*) as nb FROM verification_audit GROUP BY code_iso") or []
+        verifs = {(r.get("code_iso") or "").upper(): r["nb"] for r in rows_v}
+
+        rows_i = query_all("SELECT code_iso, COUNT(*) as nb FROM pep GROUP BY code_iso") or []
+        inseres = {(r.get("code_iso") or "").upper(): r["nb"] for r in rows_i}
+
+        ds = statut_dump()
+        return dump_stats, verifs, inseres, ds
+    except Exception as _cov_e:
+        return {}, {}, {}, {}
+
+_dump_stats, _verifs_cov, _inseres_cov, _ds_info = _charger_stats_couverture()
+
+_PAYS_COV   = ["MA", "DZ", "TN", "LY", "SN", "CI", "ML", "BF", "NE", "TG", "BJ", "GW", "GN"]
+_NOMS_PAYS_COV = {
+    "MA": "Maroc", "DZ": "Algérie", "TN": "Tunisie", "LY": "Libye",
+    "SN": "Sénégal", "CI": "Côte d'Ivoire", "ML": "Mali", "BF": "Burkina Faso",
+    "NE": "Niger", "TG": "Togo", "BJ": "Bénin", "GW": "Guinée-Bissau", "GN": "Guinée",
+}
+
+_tot_dump    = sum(_dump_stats.values())
+_tot_verifs  = sum(_verifs_cov.values())
+_tot_inseres = sum(_inseres_cov.values())
+
+_cov1, _cov2, _cov3 = st.columns(3)
+with _cov1:
+    st.metric("PEP dans le dump", f"{_tot_dump:,}", help="Entités PEP africaines indexées dans le dump OpenSanctions local")
+with _cov2:
+    st.metric("Vérifiés (audit)", f"{_tot_verifs:,}", help="Vérifications complètes tracées dans verification_audit")
+with _cov3:
+    st.metric("Insérés en base", f"{_tot_inseres:,}", help="PEP confirmés dans la table pep")
+
+if _ds_info:
+    _dl = (_ds_info.get("telecharge_le") or "")[:10]
+    st.caption(
+        f"Dump — version : **{_ds_info.get('updated_at','?')}** | "
+        f"téléchargé le : {_dl} | {_ds_info.get('taille_mb', 0)} MB"
+    )
+
+_rows_cov = []
+for _code in _PAYS_COV:
+    _rows_cov.append({
+        "Pays":       _NOMS_PAYS_COV.get(_code, _code),
+        "ISO":        _code,
+        "Dans dump":  _dump_stats.get(_code, 0),
+        "Vérifiés":   _verifs_cov.get(_code, 0),
+        "Insérés":    _inseres_cov.get(_code, 0),
+    })
+
+_df_cov = pd.DataFrame(_rows_cov).sort_values("Dans dump", ascending=False)
+st.dataframe(
+    _df_cov,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Dans dump": st.column_config.NumberColumn("Dans dump 🗄️", format="%d"),
+        "Vérifiés":  st.column_config.NumberColumn("Vérifiés ✅",   format="%d"),
+        "Insérés":   st.column_config.NumberColumn("Insérés en base 📥", format="%d"),
+    },
+)
 
 # ── Section : Performances de l'agent ────────────────────────────────────────────
 st.markdown("---")
