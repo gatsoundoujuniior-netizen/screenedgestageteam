@@ -1,0 +1,114 @@
+nom_complet;code_iso;categorie;resultat_agent;ground_truth_pep;stabilite;nb_runs;source;note
+Abdelmadjid Tebboune;DZ;chef_etat;true;true;stable;1;audit;Président DZ
+Abdourahamane Tiani;NE;chef_etat;true;true;stable;1;audit;Président NE (junte 2023)
+Alassane Ouattara;CI;chef_etat;true;true;stable;2;audit;Président CI
+Assimi Goïta;ML;chef_etat;true;true;stable;1;audit;Président ML (transition)
+Aziz Akhannouch;MA;chef_etat;true;true;stable;1;audit;Premier ministre MA
+Bassirou Diomaye Faye;SN;chef_etat;true;true;stable;1;audit;Président SN depuis 2024
+Faure Essozimna Gnassingbé;TG;chef_etat;true;true;stable;1;audit;Président TG
+Faure Gnassingbé;TG;chef_etat;true;true;stable;1;audit;Président TG
+Ibrahim Traoré;BF;chef_etat;true;true;stable;1;audit;Président BF (transition)
+Kais Saied;TN;chef_etat;true;true;stable;1;audit;Président TN
+Macky Sall;SN;chef_etat;true;true;stable;1;audit;Président SN 2012-2024
+Mamady Doumbouya;GN;chef_etat;true;true;stable;3;audit;Président GN (transition)
+Mohamed Bazoum;NE;chef_etat;true;true;stable;2;audit;Président NE renversé 2023
+Mohamed El-Menfi;LY;chef_etat;true;true;stable;1;audit;Pdt Conseil présidentiel LY
+Ousmane Sonko;SN;chef_etat;true;true;stable;1;audit;Premier ministre SN 2024
+Patrice Talon;BJ;chef_etat;true;true;stable;1;audit;Président BJ
+Umaro Sissoco Embaló;GW;chef_etat;true;true;stable;3;audit;Président GW
+Abdelilah Benkirane;MA;ex_pep;false;true;stable;1;audit;Ex-Chef Gouvernement MA 2011-2017 — FAUX NÉGATIF
+Abdoulaye Wade;SN;ex_pep;true;true;stable;1;audit;Ex-Président SN
+Alpha Condé;GN;ex_pep;true;true;stable;2;audit;Ex-Président GN
+Blaise Compaoré;BF;ex_pep;true;true;stable;1;audit;Ex-Président BF
+Dioncounda Traoré;ML;ex_pep;true;true;stable;1;audit;Ex-Pdt transition ML
+Ibrahim Boubacar Keïta;ML;ex_pep;true;true;stable;1;audit;Ex-Président ML
+Issoufou Mahamadou;NE;ex_pep;true;true;stable;1;audit;Ex-Président NE
+Jean Zida;BF;ex_pep;true;true;stable;1;audit;Ex-Premier ministre BF transition
+Modibo Sidibé;ML;ex_pep;true;true;stable;1;audit;Ex-Premier ministre ML
+Moussa Dadis Camara;GN;ex_pep;true;true;stable;1;audit;Ex-Président GN junte
+Roch Marc Christian;BF;ex_pep;true;true;stable;1;audit;Ex-Président BF (nom tronqué)
+Roch Marc Christian Kaboré;BF;ex_pep;true;true;stable;1;audit;Ex-Président BF
+Amadou Toumani Touré;ML;ex_pep_decede;true;true;stable;1;audit;Président ML 2002-2012, décédé 2020 / Ex-Président ML décédé 2020 — détecté ✅
+Houphouët-Boigny;CI;ex_pep_decede;false;true;stable;1;audit;Fondateur CI décédé 1993 — limite temporelle / Fondateur CI décédé 1993 — hors fenêtre temporelle ❌ FN
+Mathieu Kérékou;BJ;ex_pep_decede;false;true;stable;1;audit;Président BJ 1972-2006, décédé 2015 / Président BJ décédé 2015 — hors fenêtre temporelle ❌ FN
+Abdou Diouf;SN;ex_pep_ancien;true;true;stable;1;audit;Président SN 1981-2000, ex-SG Francophonie / Ex-Président SN — détecté ✅
+Moussa Traoré;ML;ex_pep_ancien;false;true;stable;1;audit;Président ML 1968-1991 — très ancien / Président ML 1968-1991 — très ancien ❌ FN
+Abdoulaye Diop;ML;ministre;true;true;stable;1;audit;Ministre AE ML (junte) / Ministre AE ML (junte) — détecté ✅
+Adama Bictogo;CI;ministre;true;true;stable;1;audit;Président Assemblée CI
+Aminata Touré;SN;ministre;true;true;stable;1;audit;Ex-Première ministre SN
+Bah Oury;GN;ministre;true;true;stable;1;audit;Ministre GN
+Cheick Modibo Diarra;ML;ministre;true;true;stable;1;audit;Ex-Premier ministre ML
+Cheikh Tidiane Gadio;SN;ministre;true;true;stable;1;audit;Ex-ministre AE SN
+Choguel Kokalla Maïga;ML;ministre;true;true;stable;1;audit;Premier ministre ML transition
+Idrissa Seck;SN;ministre;true;true;stable;1;audit;Ex-Premier ministre SN
+Jean-Louis Billon;CI;ministre;true;true;stable;1;audit;Ministre CI
+Kadré Désiré Ouédraogo;BF;ministre;true;true;stable;1;audit;Ex-Pdt Commission UEMOA
+Leila Benali;MA;ministre;true;true;stable;1;audit;Ministre Énergie MA
+Mahamane Ousmane;NE;ministre;true;true;stable;1;audit;Ex-Président NE
+Mariam Camara;GN;ministre;true;true;stable;1;audit;Ministre GN
+Moustapha Niasse;SN;ministre;true;true;stable;1;audit;Ex-Président Assemblée SN
+Nadia Fettah Alaoui;MA;ministre;true;true;stable;1;audit;Ministre des Finances MA
+Ousmane Sarr;SN;ministre;true;true;stable;1;audit;Ancien ministre SN
+Pascal Affi N'Guessan;CI;ministre;true;true;stable;1;audit;Chef parti opposition CI
+Romuald Wadagni;BJ;ministre;true;true;stable;1;audit;Ministre des Finances BJ
+Tiébilé Dramé;ML;ministre;true;true;stable;1;audit;Ex-ministre AE ML
+Victoire Tomégah-Dogbé;TG;ministre;true;true;stable;1;audit;Premier ministre TG (femme)
+Abdelkrim Benchâaboun;XX;haut_fonc;false;true;stable;1;audit;Ex-Gouv BkAlMaghrib / Ambassadeur MA — FAUX NÉGATIF
+Abdellatif Jouahri;MA;haut_fonc;true;true;stable;1;audit;Gouverneur Bank Al-Maghrib MA
+Lassina Zerbo;BF;haut_fonc;true;true;stable;1;audit;Ex-Dir CTBTO / PM BF 2022
+Mohamed El Hajjoui;MA;haut_fonc;true;true;stable;1;audit;Directeur ANCFCC MA
+Tiémoko Meyliet Koné;CI;haut_fonc;true;true;stable;1;audit;Gouverneur BCEAO CI
+Akinwumi Adesina;XX;supra_national;false;true;stable;1;audit;Président BAD, nationalité nigériane/CI — INSTABLE
+Cheikh Hadjibou Soumaré;SN;supra_national;true;true;stable;1;audit;Ex-Pdt Commission UEMOA / Ex-Pdt Commission UEMOA — détecté ✅
+Jean-Claude Kassi Brou;CI;supra_national;true;true;stable;1;audit;Président BCEAO, ivoirien
+Abdel-Tebboune;DZ;proche_pep;true;true;stable;1;audit;Fils Abdelmadjid Tebboune — DZ loi 05-01 art.4: enfants inclus / Fils Tebboune — agent a normalisé vers père (résultat correct PEP=true) ✅
+Aliou Sall;SN;proche_pep;true;true;stable;1;audit;Frère Macky Sall, ex-DG PETROSEN
+Karim Wade;SN;proche_pep;false;true;stable;1;audit;Fils Abdoulaye Wade, ex-ministre SN / Fils Abdoulaye Wade / ex-ministre SN — non détecté ❌ FN proche_pep
+Rakia Issoufou;NE;proche_pep;false;true;stable;1;audit;Fille Issoufou Mahamadou — NE Directive UEMOA: enfants inclus (faux négatif agent)
+Dominique Claudine Ouattara;CI;epouse_pep;true;true;stable;1;audit;Épouse Alassane Ouattara — CI Ord.2023-875 art.2-x: conjoint inclus
+Fatoumata Traoré;BF;epouse_pep;false;true;stable;1;audit;Épouse Ibrahim Traoré — BF Loi 46-2024: conjoint inclus / Épouse Ibrahim Traoré BF — non détectée ❌ FN epouse
+Hadiza Bazoum;NE;epouse_pep;true;true;stable;1;audit;Épouse Mohamed Bazoum — NE Ordonnance 2024-56: conjoint inclus
+Kadiatou Touré;GN;epouse_pep;false;true;stable;1;audit;Épouse Mamady Doumbouya — GN GAFI Rec.12: conjoint inclus / Épouse Mamady Doumbouya GN — non détectée ❌ FN epouse
+Marème Faye Sall;SN;epouse_pep;true;true;stable;1;audit;"Épouse Macky Sall — SN Loi 2024-08 art.2: ""conjoint PPE"" explicitement nommé"
+Nafissatou Diallo;SN;epouse_pep;false;false;stable;1;audit;Nom commun SN — aucune épouse de PEP connue avec ce nom (homonyme DSK) / Homonyme DSK — correctement non-PEP ✅ TN
+Amadou Ouattara;CI;homonyme;true;false;stable;1;audit;Nom Ouattara très fréquent CI / HOMONYME CI — FP: agent a confondu avec Alassane Ouattara ❌ FP
+Amina Boukhari;MA;homonyme;false;false;stable;1;audit;Nom commun MA
+Cheikh Diagne;SN;homonyme;false;false;stable;1;audit;Nom commun SN
+Fatima Fettah;XX;homonyme;false;false;stable;1;audit;≠ Nadia Fettah Alaoui (ministre)
+Fatima Zahra;MA;homonyme;false;false;stable;1;audit;Prénom commun MA, pas de PEP identifiée
+Ibrahim Coulibaly Guindo;ML;homonyme;false;false;stable;1;audit;Nom ML, pas de PEP connu
+Macky Ngom;SN;homonyme;false;false;stable;1;audit;Prénom Macky ≠ Macky Sall
+Mamadou Diallo;GN;homonyme;false;false;stable;1;audit;Nom commun GN, pas de PEP connu / Nom commun GN — correctement non-PEP ✅ TN
+Mohammed Bennani;MA;homonyme;false;false;stable;1;audit;Nom très commun MA
+Oumar Touré;ML;homonyme;true;false;stable;1;audit;Homonyme partiel ATT / HOMONYME ML — FP: agent a confondu avec ATT ❌ FP
+Abdelaziz Rhouhane;XX;corpus_mince;false;false;stable;1;audit;MA — corpus mince
+Abdelouahed Benchekroun;XX;corpus_mince;false;false;stable;1;audit;MA — corpus mince
+Amadou Abdoulaye Diallo;GW;corpus_mince;false;false;stable;1;audit;GW — nom commun, pas de PEP identifié, loi nationale non localisée / Nom commun GW — correctement non-PEP ✅ TN
+Aïssatou Sow;XX;corpus_mince;false;false;stable;1;audit;GW — introuvable
+Buréima Badini;XX;corpus_mince;false;false;stable;1;audit;BF — introuvable
+Fatoumata Diallo;GN;corpus_mince;true;false;stable;1;audit;GN — nom commun, pas PEP identifiée
+Hamidou Diabaté;XX;corpus_mince;false;false;stable;1;audit;CI — introuvable
+Oumou Sall Seck;SN;corpus_mince;false;true;stable;1;audit;Ancienne ministre SN, corpus limité / Ancienne ministre SN corpus mince — non détectée ❌ FN
+Fatou Diallo;TG;ambigु;false;false;stable;1;audit;TG — nom très commun, aucune Fatou Diallo PEP identifiée au TG
+Ali Bongo Ondimba;XX;hors_perimetre;false;false;stable;1;audit;Ex-Président Gabon — hors périmètre
+Brice Clotaire Oligui Nguema;XX;hors_perimetre;false;false;stable;2;audit;Président Gabon — hors périmètre
+Denis Sassou Nguesso;XX;hors_perimetre;false;false;stable;1;audit;Président Congo-B — hors périmètre / Président Congo-B hors périmètre — correctement rejeté ✅ TN
+Evariste Ndayishimiye;XX;hors_perimetre;false;false;stable;1;audit;Président Burundi — hors périmètre / Président Burundi hors périmètre — correctement rejeté ✅ TN
+Farrukh Tashkentov;XX;hors_perimetre;false;false;stable;1;audit;Test nom non-africain / Nom non-africain — correctement rejeté ✅ TN
+Faustin-Archange Touadéra;XX;hors_perimetre;false;false;stable;1;audit;Président RCA — hors périmètre
+Felix Tshisekedi;XX;hors_perimetre;false;false;stable;1;audit;Président RDC — hors périmètre / Président RDC hors périmètre — correctement rejeté ✅ TN
+Idriss Déby Itno;XX;hors_perimetre;false;false;stable;1;audit;Ex-Président Tchad — hors périmètre
+Ismail Omar Guelleh;XX;hors_perimetre;false;false;stable;1;audit;Président Djibouti — hors périmètre
+Mohamed Ould Cheikh El Ghazouani Ould Ghazouani;XX;hors_perimetre;false;false;stable;1;audit;Président Mauritanie — hors périmètre
+Moussa Faki Mahamat;XX;hors_perimetre;false;false;stable;1;audit;Pdt Commission UA — tchadien (hors périmètre)
+Nana Addo Akufo-Addo;XX;hors_perimetre;false;false;stable;1;audit;Président Ghana — hors périmètre
+Paul Biya;XX;hors_perimetre;false;false;stable;1;audit;Président Cameroun — hors périmètre / Président Cameroun hors périmètre — correctement rejeté ✅ TN
+Angélique Kidjo;BJ;non_pep;false;false;stable;1;audit;Artiste BJ / Artiste BJ — correctement non-PEP ✅ TN
+Didier Drogba;CI;non_pep;false;false;stable;1;audit;Footballeur CI / Footballeur CI — correctement non-PEP ✅ TN
+Hakim Ziyech;MA;non_pep;false;false;stable;1;audit;Footballeur MA
+Kalidou Koulibaly;SN;non_pep;false;false;stable;1;audit;Footballeur SN
+Riyad Mahrez;DZ;non_pep;false;false;stable;1;audit;Footballeur DZ
+Sadio Mané;SN;non_pep;false;false;stable;1;audit;Footballeur SN
+Sidiki Diabaté;GN;non_pep;false;false;stable;1;audit;Artiste/musicien GN
+Tidjane Thiam;CI;non_pep;false;false;stable;1;audit;Ex-CEO Crédit Suisse, ivoirien, pas de fonction publique / Ex-CEO Crédit Suisse CI — correctement non-PEP ✅ TN
+Youssou Ndour;SN;non_pep;true;false;stable;1;audit;Artiste SN — ministre 3 mois en 2012 (cas limite) / Artiste SN — FP/cas limite: ministre 3 mois 2012 ❌ FP

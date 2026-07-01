@@ -20,12 +20,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_tavily import TavilySearch
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
-from db_utils import query_one, execute
+from db_utils import query_one, execute, get_pg_conn
 from search_tools import (rechercher_pep, est_source_officielle, est_source_secondaire,
                           est_source_verification, DOMAINES_INTERDITS,
                           extraire_passages_nom, consensus_sources,
                           filtrer_resultats, annoter_sources,
-                          _tavily_invoke, reset_compteur_personne, get_compteur)
+                          _tavily_invoke, reset_compteur_personne, get_compteur,
+                          get_url_logs, reset_url_logs)
 
 tavily_search = TavilySearch(max_results=5, search_depth="advanced")
 
@@ -107,30 +108,81 @@ _QUOTA_KEYWORDS = ("RateLimitError", "rate_limit", "quota", "429",
 def _is_quota_error(e: Exception) -> bool:
     return any(k in str(e) for k in _QUOTA_KEYWORDS)
 
+def _is_tpd_error(exc_str: str) -> bool:
+    """True si l'erreur est un quota journalier épuisé (TPD / per day / GenerateRequestsPerDay).
+    Ces quotas mettent des minutes à se libérer → fallback immédiat sans attente."""
+    s = exc_str.lower()
+    return ("per day" in s or "tokens per day" in s or "tpd" in s
+            or "perrequestsperday" in s or "perdayperproject" in s
+            or "generaterequestsperday" in s)
+
+def _extract_retry_tpm(exc_str: str) -> float:
+    """Extrait le délai suggéré pour un rate limit minute (TPM/RPM).
+    Ne s'applique PAS aux erreurs TPD (quota jour) → retourne 0."""
+    if _is_tpd_error(exc_str):
+        return 0.0
+    m = re.search(r'try again in ([\d.]+)s', exc_str, re.IGNORECASE)
+    if m:
+        return min(float(m.group(1)) + 1.0, 90.0)
+    return 0.0
+
 # ── Capture audit LLM (modèle utilisé pour la qualification) ─────────────────────
 _audit_llm: dict = {"modele": "", "prompt": "", "reponse": ""}
 
 def _llm_invoke(prompt):
-    """Appel LLM avec fallback automatique Groq-1 → Groq-2 → Groq-3 → Gemini."""
+    """Appel LLM avec fallback automatique Groq-1 → Groq-2 → Groq-3 → Gemini.
+    TPM/RPM (rate limit minute) → attend le délai suggéré et retente UNE fois.
+    TPD (quota journalier épuisé)  → fallback immédiat, pas d'attente inutile.
+    """
+    import time as _t
     last_exc = None
     for llm_inst, tracker_fn, label in _LLM_CHAIN:
-        try:
-            response = llm_inst.invoke(prompt)
-            _audit_llm["modele"] = label  # capturer quel modèle a répondu
+        for _attempt in range(2):  # max 2 tentatives par instance
             try:
-                usage = getattr(response, "usage_metadata", None) or {}
-                tin   = usage.get("input_tokens", 0)
-                tout  = usage.get("output_tokens", 0)
-                tracker_fn(tokens_entree=tin, tokens_sortie=tout)
-            except Exception:
-                pass
-            return response
-        except Exception as e:
-            last_exc = e
-            if _is_quota_error(e):
-                print(f"  [LLM] {label} quota épuisé → fallback suivant")
-                continue
-            raise
+                response = llm_inst.invoke(prompt)
+                _audit_llm["modele"] = label
+                try:
+                    usage = getattr(response, "usage_metadata", None) or {}
+                    tin   = usage.get("input_tokens", 0)
+                    tout  = usage.get("output_tokens", 0)
+                    tracker_fn(tokens_entree=tin, tokens_sortie=tout)
+                except Exception:
+                    pass
+                return response
+            except Exception as e:
+                last_exc = e
+                if _is_quota_error(e):
+                    exc_str = str(e)
+                    wait = _extract_retry_tpm(exc_str)
+                    if wait > 0 and _attempt == 0:
+                        # Rate limit minute (TPM/RPM) → attendre et retenter
+                        print(f"  [LLM] {label} rate limit minute → attente {wait:.0f}s puis retry...")
+                        _t.sleep(wait)
+                        continue
+                    else:
+                        # Quota journalier (TPD) ou 2ème tentative → fallback immédiat
+                        if _is_tpd_error(exc_str):
+                            # Extraire les vrais chiffres TPD et les persister dans api_usage.json
+                            _m = re.search(r'Limit (\d+), Used (\d+)', exc_str)
+                            if _m:
+                                _lim, _used = int(_m.group(1)), int(_m.group(2))
+                                try:
+                                    if "Groq-1" in label:
+                                        from api_tracker import enregistrer_quota_reel_groq as _erq; _erq(1, _used, _lim)
+                                    elif "Groq-2" in label:
+                                        from api_tracker import enregistrer_quota_reel_groq as _erq; _erq(2, _used, _lim)
+                                    elif "Groq-3" in label:
+                                        from api_tracker import enregistrer_quota_reel_groq as _erq; _erq(3, _used, _lim)
+                                    elif "Gemini" in label:
+                                        from api_tracker import enregistrer_quota_reel_gemini as _erg; _erg(_used, _lim)
+                                except Exception:
+                                    pass
+                            print(f"  [LLM] {label} TPD journalier épuisé → fallback suivant")
+                        else:
+                            print(f"  [LLM] {label} quota épuisé → fallback suivant")
+                        break
+                else:
+                    raise
     raise last_exc
 
 # ── Score qualité source ──────────────────────────────────────────────────────────
@@ -442,6 +494,7 @@ class PEPState(TypedDict):
     urls_officielles_trouvees: list   # URLs officielles extraites du corpus
     urls_media_trouvees: list         # URLs médias extraites du corpus
     opensanctions_confirmed: bool     # Tier 3 a confirmé PEP
+    _votes_pays: int                  # Score de confiance identification pays (0=inconnu, 2=1 source, 4+=certain)
     # Qualification
     est_pep: bool
     statut_mandat: str
@@ -500,11 +553,20 @@ En analysant UNIQUEMENT les résultats ci-dessus (pas ta mémoire), réponds en 
 }}
 
 RÈGLES STRICTES :
+- RÈGLE ABSOLUE ANTI-SUBSTITUTION (identification pays) : Chercher LE PAYS associé à {prenom} {nom} spécifiquement, pas celui d'une autre personne portant le même nom de famille. Ex : "Dominique Ouattara" (Première dame CI) ≠ "Alassane Ouattara" (Président CI). MAIS : si {prenom} {nom} est l'épouse/conjoint/enfant d'un PEP identifié dans le corpus → le code_iso EST celui du PEP de référence (c'est autorisé et attendu pour les proches).
+- PROCHE DE PEP : si les résultats indiquent que {prenom} {nom} est "épouse de [NOM]", "fils de [NOM]", "Première dame de [PAYS]" → code_iso = pays du PEP de référence. Ex : "Marème Faye Sall, épouse de Macky Sall (Sénégal)" → code_iso = SN. "Hadiza Bazoum, épouse du président du Niger" → code_iso = NE.
 - code_iso = pays du GOUVERNEMENT auquel APPARTIENT la personne (où elle exerce/a exercé son mandat)
 - Si les résultats indiquent "président du Congo" → code_iso = "CG" ; "président du Cameroun" → "CM" ; "président du Maroc" → "MA" ; etc.
 - Si les résultats mentionnent "ancien président de [pays]", "ex-président de [pays]" → extraire CE pays
 - ATTENTION : si une personne étrangère a simplement VISITÉ un pays ou participé à un sommet dans ce pays, ce pays n'est PAS son code_iso
 - ATTENTION : si l'article est publié par un média marocain/algérien mais parle d'un dirigeant congolais → code_iso = CG, pas MA/DZ
+- INSTITUTIONS AFRICAINES SUPRANATIONALES DU PÉRIMÈTRE (BAD, BCEAO, UEMOA, BOAD) : utiliser le PAYS SIÈGE comme code_iso — ces institutions font partie du périmètre de surveillance AML ScreenEdge Africa :
+  • Président/DG de la BAD (Banque Africaine de Développement, siège Abidjan, Côte d'Ivoire) → CI
+  • Gouverneur/Président de la BCEAO (siège Dakar, Sénégal) → SN
+  • Président/Commission UEMOA (siège Ouagadougou, Burkina Faso) → BF
+  • Président/DG de la BOAD (Banque Ouest Africaine de Développement, siège Lomé, Togo) → TG
+  La nationalité de la personne est ignorée pour ces 4 institutions — seul le pays siège compte.
+- AUTRES ORGANISATIONS INTERNATIONALES (ONU, UA, CEDEAO, FMI, Banque Mondiale, BID, CUA, etc.) : le code_iso doit être la NATIONALITÉ de la personne. Exemple : Président de la CEDEAO nigérian basé à Abuja → code_iso = NG. Si nationalité non déterminable → code_iso = XX
 - Si les résultats ne permettent pas de déterminer le pays du mandat → code_iso = XX"""
 
 def node_identify(state: PEPState) -> PEPState:
@@ -676,8 +738,12 @@ def node_identify(state: PEPState) -> PEPState:
     if code_iso == "XX":
         print(f"  → {pays_nom} ({code_iso}) hors périmètre — classé Non-PEP automatiquement")
 
+    _votes_max = max(votes_code.values()) if votes_code else 0
+    if _votes_max <= 2 and code_iso != "XX":
+        print(f"  → Confiance pays faible ({_votes_max} vote(s)) — pays incertain : {pays_nom} ({code_iso})")
     return {**state, "code_iso": code_iso, "pays_nom": pays_nom,
-            "fonction_trouvee": fonction, "resultats_recherche": resultats}
+            "fonction_trouvee": fonction, "resultats_recherche": resultats,
+            "_votes_pays": _votes_max}
 
 # ── Chargement du référentiel JSON au démarrage ──────────────────────────────────
 
@@ -790,11 +856,13 @@ def node_search(state: PEPState) -> PEPState:
     nb_mots = len(contenu.split()) if contenu else 0
     print(f"  Résultat : {nb_mots} mots | {len(urls_off)} URLs off | {len(urls_med)} URLs médias")
 
-    # Enrichir avec les résultats d'identification si corpus insuffisant
-    if nb_mots < 300 and code != "XX" and resultats_identification:
+    # Toujours injecter le résultat d'identification en tête du corpus
+    # (contient les snippets Serper/Tavily les plus récents sur la fonction actuelle)
+    if resultats_identification and code != "XX":
         mots_id = len(resultats_identification.split())
         if mots_id > 20:
-            contenu = resultats_identification + "\n\n---\n\n" + contenu if contenu.strip() else resultats_identification
+            header_id = f"[RECHERCHE INITIALE — SERPER/TAVILY ACTUEL]\n{resultats_identification}"
+            contenu = header_id + "\n\n---\n\n" + contenu if contenu.strip() else header_id
             nb_mots = len(contenu.split())
             print(f"  Enrichi avec résultats identify ({mots_id} mots) → {nb_mots} mots")
 
@@ -845,14 +913,94 @@ def node_search(state: PEPState) -> PEPState:
     code_iso_final = code
     pays_nom_final = state["pays_nom"]
     if os_confirmed and code == "XX":
-        pays_os_match = re.search(r'"pays":\s*\[\s*"([a-z]{2})"', contenu_brut)
-        if pays_os_match:
-            os_iso = pays_os_match.group(1).upper()
-            if os_iso in PAYS_PERIMETRE:
-                code_iso_final = os_iso
-                if os_iso in _referentiel_json:
-                    pays_nom_final = _referentiel_json[os_iso]["pays"]
-                print(f"  [Tier 3] OpenSanctions → pays identifié : {pays_nom_final} ({code_iso_final})")
+        # Lire le marqueur structuré [OS_PAYS:XX,ML,...] injecté par search_tools
+        _tag_m = re.search(r'\[OS_PAYS:([A-Z,]+)\]', contenu_brut)
+        if _tag_m and _tag_m.group(1) != "XX":
+            for _iso in _tag_m.group(1).split(","):
+                if _iso in PAYS_PERIMETRE:
+                    code_iso_final = _iso
+                    if _iso in _referentiel_json:
+                        pays_nom_final = _referentiel_json[_iso]["pays"]
+                    print(f"  [Tier 3] OpenSanctions → pays identifié : {pays_nom_final} ({code_iso_final})")
+                    break
+
+    # ── Enrichissement famille/proche ────────────────────────────────────────────────
+    _fam_kw = ["épouse", "premiere dame", "première dame", "conjoint", "fils de", "fille de",
+               "femme du president", "femme du président", "proche pep"]
+    _PAYS_FAM_MAP = {
+        "burkina": "BF", "guinee": "GN", "guinea": "GN",
+        "nigerien": "NE", "niger ": "NE",
+        "mali ": "ML", "malien": "ML",
+        "senegal": "SN", "senegalais": "SN",
+        "cote d ivoire": "CI", "ivoirien": "CI",
+        "togolais": "TG", "togo ": "TG",
+        "beninois": "BJ", "benin ": "BJ",
+        "marocain": "MA", "maroc ": "MA",
+        "algerien": "DZ", "algerie": "DZ",
+        "tunisien": "TN", "tunisie": "TN",
+        "libyen": "LY", "libye ": "LY",
+        "bissau": "GW", "guinee-bissau": "GW",
+    }
+    def _norm_pays(s):
+        return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+    def _deduire_pays_famille(texte: str) -> str:
+        """Extrait le code_iso depuis un texte famille (retourne None si non trouvé)."""
+        _t = _norm_pays(texte)
+        for _kp, _iso in _PAYS_FAM_MAP.items():
+            if _kp in _t:
+                return _iso
+        return None
+
+    # Vérifier uniquement dans les passages proches du nom (évite pollution du corpus global)
+    _contenu_pres_nom = extraire_passages_nom(contenu, nom_complet) or ""
+    _has_fam_kw = any(kw in _contenu_pres_nom.lower() for kw in _fam_kw)
+    _fam_inclus = (_referentiel_json.get(code_iso_final, {}).get("famille_incluse", False)
+                   or code_iso_final == "XX")
+
+    _country_corrected = False
+    if _has_fam_kw and code_iso_final in ("XX", "ML", "CI", "SN", "BF", "NE", "TG", "BJ", "GW", "GN"):
+        _pass_norm_fam = _norm_pays(_contenu_pres_nom)
+        import re as _re_fam
+        _kws_pays_joined = '|'.join(_PAYS_FAM_MAP.keys())
+        _fam_kws_joined  = r'(?:epouse|premiere dame|conjoint|femme du|fils du)'
+        # Chercher dans les deux sens : "épouse…pays" ET "pays…épouse"
+        _m_fam = (_re_fam.search(_fam_kws_joined + r'.{0,80}(?:' + _kws_pays_joined + r')', _pass_norm_fam)
+                  or _re_fam.search(r'(?:' + _kws_pays_joined + r').{0,80}' + _fam_kws_joined, _pass_norm_fam))
+        if _m_fam:
+            for _kp, _iso in _PAYS_FAM_MAP.items():
+                if _kp in _m_fam.group(0) and _iso != code_iso_final and _iso in _referentiel_json:
+                    code_iso_final = _iso
+                    pays_nom_final = _referentiel_json[_iso]["pays"]
+                    print(f"  Pays corrigé via lien famille dans corpus : {pays_nom_final} ({code_iso_final})")
+                    _country_corrected = True
+                    break
+        # Injecter les passages famille en tête de corpus pour que le LLM les voie en priorité
+        if "[LIEN FAMILLE PROCHE GAFI]" not in contenu and _contenu_pres_nom:
+            contenu = f"[LIEN FAMILLE PROCHE GAFI — Article R12]\n{_contenu_pres_nom[:1500]}\n\n---\n\n" + contenu
+            print(f"  Lien famille injecté en tête du corpus ({code_iso_final})")
+
+    if _fam_inclus and not _has_fam_kw:
+        # Pas de mot-clé famille dans le corpus → recherche externe Serper
+        try:
+            from search_tools import rechercher_google as _sg_fam
+            _q_fam = f"{nom_complet} épouse Première dame conjoint"
+            _txt_fam, _, _ = _sg_fam(_q_fam, state["pays_nom"], code_iso_final)
+            if _txt_fam and len(_txt_fam.split()) > 20:
+                _pass_fam = extraire_passages_nom(_txt_fam, nom_complet) or _txt_fam[:2000]
+                if _pass_fam and any(kw in _pass_fam.lower() for kw in _fam_kw):
+                    contenu += "\n\n[RECHERCHE LIEN FAMILLE/PROCHE GAFI]\n" + _pass_fam[:3000]
+                    print(f"  Enrichi lien-famille Serper → {len(contenu.split())} mots")
+                    _iso_fam2 = _deduire_pays_famille(_pass_fam)
+                    if _iso_fam2 and _iso_fam2 in _referentiel_json and _iso_fam2 != code_iso_final:
+                        code_iso_final = _iso_fam2
+                        pays_nom_final = _referentiel_json[_iso_fam2]["pays"]
+                        print(f"  Pays déduit du lien famille Serper : {pays_nom_final} ({code_iso_final})")
+                else:
+                    print(f"  Serper famille : aucun lien famille trouvé")
+            else:
+                print(f"  Serper famille : résultat court ({len((_txt_fam or '').split())} mots)")
+        except Exception as _ef:
+            print(f"  Serper famille erreur : {_ef}")
 
     _log_corpus(nom_complet, code, contenu_brut, contenu)
 
@@ -870,6 +1018,7 @@ def node_search(state: PEPState) -> PEPState:
 PROMPT_QUALIFICATION = """Tu es un expert en conformité AML/PPE francophone. Réponds UNIQUEMENT en JSON valide.
 
 ANNÉE COURANTE : {annee}
+DATE D'AUJOURD'HUI : {date_today}
 PERSONNE À VÉRIFIER : {prenom} {nom} ({pays})
 
 PÉRIMÈTRE PEP OFFICIEL DU PAYS (JSON structuré) :
@@ -885,8 +1034,30 @@ Si la fonction trouvée est sémantiquement équivalente à un item de "fonction
 Si "famille_incluse" = true → les proches (conjoint, enfants, parents) sont aussi PEP.
 Si "duree_ex_pep" = "permanente" → une ancienne PEP reste PEP indéfiniment même après la fin du mandat.
 
+RÈGLE FAMILLE INCLUSE (PRIORITÉ ABSOLUE — s'applique si famille_incluse = true) :
+Si le corpus mentionne que {prenom} {nom} est l'un des suivants :
+→ "épouse de [NOM_PEP]", "Première dame", "femme du président", "conjoint(e) du Premier ministre"
+→ "fils de [NOM_PEP]", "fille de [NOM_PEP]", "enfant du chef d'état", "fils du président"
+→ même si {prenom} {nom} n'a AUCUNE fonction publique propre
+ALORS : est_pep = OBLIGATOIREMENT true, statut_mandat selon le statut du PEP de référence.
+fonction = "Proche PEP — [relation] de [Prénom Nom du PEP]" (ex: "Épouse du Président Ibrahim Traoré", "Fils du Président Abdoulaye Wade")
+RÈGLE SOURCE PROCHE : 1 source [MEDIA⚠️] suffit pour valider un proche PEP (pas besoin d'[OFFICIEL✅]).
+Ne PAS exiger une source gouvernementale directe pour les proches — les médias et Wikipedia suffisent.
+
+RÈGLE CRITIQUE — PREMIÈRE DAME / PROCHE D'EX-PEP :
+Si la fonction de {prenom} {nom} est "Première dame", "épouse du président", "conjoint de" ou équivalent :
+- Si le mari/époux EST encore en fonction → statut_mandat = "actif"
+- Si le mari/époux A ÉTÉ renversé, démis, a démissionné, ou a quitté le pouvoir → statut_mandat = "ex_pep"
+- PIÈGE FRÉQUENT : "Première dame du Niger" avec Mohamed Bazoum renversé en 2023 → ex_pep, pas actif
+- La fonction de proche suit TOUJOURS le statut du PEP de référence (mari/parent)
+
 DONNÉES TROUVÉES SUR SOURCES OFFICIELLES :
 {resultats}
+
+RÈGLE ABSOLUE ANTI-SUBSTITUTION ET ANTI-EXPANSION DE NOM :
+Tu qualifies EXCLUSIVEMENT {prenom} {nom}. Si le corpus parle davantage d'une autre personne (ex: le mari, le père), ignorer leurs fonctions pour le champ "fonction" — sauf pour appliquer la règle famille_incluse. Ne JAMAIS retourner le nom d'une autre personne dans "fonction" comme si c'était celle de {prenom} {nom}.
+RÈGLE CRITIQUE ANTI-EXPANSION : Si le corpus mentionne une personne dont le nom complet est DIFFÉRENT de "{prenom} {nom}" (ex: corpus parle d'"Alassane Ouattara" mais la personne cherchée est "Amadou Ouattara", ou corpus parle d'"Amadou Toumani Touré" mais cherché est "Oumar Touré") → est_pep = false. Un prénom ne peut PAS être requalifié comme deuxième prénom d'un autre PEP. La correspondance doit être EXACTE : même prénom (1ère position) + même nom.
+Exception unique : si le corpus indique EXPLICITEMENT "{prenom} {nom}" comme alias confirmé de "[AUTRE NOM]" → est_pep = true.
 
 INSTRUCTIONS :
 Utilise TOUTES les informations disponibles pour déterminer si {prenom} {nom} est une PEP.
@@ -906,23 +1077,35 @@ Wikipedia contient la biographie complète (section introductive). Elle est LA s
 La section "=== TIER 2 — WIKIPEDIA ===" dans les données ci-dessous doit être lue EN ENTIER pour ces champs.
 
 RÈGLE ABSOLUE NOMINATION RÉCENTE :
-Si les données mentionnent une nomination, reconduction ou investiture en {annee} (année courante) → statut_mandat = "actif" OBLIGATOIREMENT, même si une fonction antérieure avait une date de fin.
-Exemple : "nommée ministre le 23 janvier {annee}" annule toute date de fin antérieure → actif.
+Si les données mentionnent une nomination, reconduction ou investiture en {annee} (année courante) ET cette date est POSTÉRIEURE à {date_today} → impossible, ignorer.
+Si nomination confirmée AVANT {date_today} → statut_mandat = "actif" OBLIGATOIREMENT.
+Exemple : "nommée ministre le 23 janvier {annee}" avec {date_today} en juin {annee} → actif.
 
 RÈGLE ABSOLUE : La fonction retournée doit être celle de {prenom} {nom} EXCLUSIVEMENT.
 Si plusieurs personnes dans les données, ignorer toutes sauf {prenom} {nom}.
 
+RÈGLE ABSOLUE — FONCTION PEP vs RÔLE DE PARTI (PRIORITÉ MAXIMALE) :
+Le champ "fonction" doit OBLIGATOIREMENT être une fonction PUBLIQUE ou GOUVERNEMENTALE.
+Fonctions valides : Président de la République, Premier ministre, Ministre, Député, Sénateur, Gouverneur, Président d'assemblée, Directeur général banque centrale, Préfet, Ambassadeur, etc.
+INTERDIT dans "fonction" — rôles de parti politique uniquement :
+→ "Président du Parti X", "Secrétaire général du Parti Y", "Secrétaire exécutif du RHDP", "Président du FPI", "Président du Parena", etc.
+Ces rôles vont UNIQUEMENT dans "fonctions_historiques", JAMAIS dans "fonction".
+Si la personne est chef de parti sans fonction gouvernementale active :
+→ "fonction" = dernière fonction gouvernementale connue + statut_mandat = "ex_pep"
+Exemple CORRECT   : Ancien PM (2000-2003) + actuellement Président du FPI → fonction = "Premier ministre", statut_mandat = "ex_pep"
+Exemple INTERDIT  : fonction = "Président du Front Populaire Ivoirien", statut_mandat = "actif" ← JAMAIS
+
 RÈGLE FONCTION LA PLUS RÉCENTE (PRIORITÉ ABSOLUE) :
-Si une fonction porte une date de fin explicite (ex: "Premier ministre (2011-2017)", "Prime Minister of Morocco (2011-2017)"),
+Si une fonction gouvernementale porte une date de fin explicite (ex: "Premier ministre (2011-2017)", "Prime Minister of Morocco (2011-2017)"),
 cette fonction EST TERMINÉE. Ne JAMAIS retourner une fonction avec date de fin comme la fonction courante.
-Cherche OBLIGATOIREMENT une fonction plus récente dans TOUTES les données (député, secrétaire général, ministre actuel, directeur...).
+Cherche OBLIGATOIREMENT une fonction GOUVERNEMENTALE plus récente dans TOUTES les données (député, ministre actuel, directeur banque centrale...).
 Exemples :
-- OpenSanctions : "Prime Minister of Morocco (2011-2017)" → cette fonction est TERMINÉE en 2017
-  + Wikipedia/Serper mentionne "député" ou "secrétaire général PJD" → fonction = "Député", statut_mandat = "actif"
+- OpenSanctions : "Prime Minister of Morocco (2011-2017)" → TERMINÉE en 2017
+  + Wikipedia/Serper mentionne "député" → fonction = "Député", statut_mandat = "actif"
 - Ancien Premier ministre (2011-2017) + actuellement député (2021-) → fonction = "Député", statut_mandat = "actif"
 - Ancien ministre + actuellement directeur banque centrale → fonction = "Directeur banque centrale", statut_mandat = "actif"
-- Si la fonction la plus récente est toujours dans le périmètre PEP → est_pep = true, statut_mandat = "actif"
-- Si la SEULE fonction connue a une date de fin et aucune autre fonction trouvée → statut_mandat = "ex_pep"
+- Ancien Premier ministre + actuellement Président du Parti X → fonction = "Premier ministre", statut_mandat = "ex_pep" (rôle de parti ignoré)
+- Si la SEULE fonction connue a une date de fin et aucune autre fonction gouvernementale trouvée → statut_mandat = "ex_pep"
 
 RÈGLE CHANGEMENT DE TITRE PAR RÉFORME :
 Si les sources mentionnent qu'une réforme constitutionnelle ou institutionnelle a remplacé un titre officiel (ex: "Président du Conseil" remplace "Président de la République"), utiliser OBLIGATOIREMENT le NOUVEAU titre même s'il est moins fréquent dans les sources.
@@ -935,11 +1118,27 @@ RÈGLE CRITIQUE — STATUT ACTIF vs EX_PEP :
 - "ancien premier ministre", "former prime minister", "ex-président" associé à {prenom} {nom} → vérifier si une AUTRE fonction PEP est active avant de dire ex_pep
 - Si une nouvelle fonction PEP active est trouvée → statut_mandat = "actif" avec la nouvelle fonction
 - En cas de doute sur le statut → statut_mandat = "actif" (principe de précaution compliance)
+- PIÈGE PASSÉ COMPOSÉ BIOGRAPHIQUE : "a occupé", "a exercé", "a été élu", "est devenu" dans un contexte biographique (ex: "Il a été élu président en 2020") NE signifie PAS que la fonction est terminée. C'est du français biographique standard pour décrire une fonction ENCORE EN COURS. Ne conclure ex_pep que si tu trouves EXPLICITEMENT : une date de fin, "a quitté", "a démissionné", "a été renversé", "successeur nommé", "n'est plus en fonction".
+
+RÈGLE CRITIQUE — DATE DE FIN DE MANDAT :
+Si les données indiquent une date de fin de mandat explicite (ex: "jusqu'au 24 mai 2026", "term ended May 24 2026", "mandat se termine le...") :
+- Comparer cette date EXACTE à DATE D'AUJOURD'HUI ({date_today})
+- Si date_fin < {date_today} → le mandat EST TERMINÉ → statut_mandat = "ex_pep"
+- ATTENTION : une date de fin en {annee} peut très bien être PASSÉE si {date_today} est après cette date
+- Exemple EXACT : date_fin = "24/05/2026", date_today = "29/06/2026" → 24/05 < 29/06 → ex_pep
+- Ne pas confondre "terminé en {annee}" (= peut être passé) avec "pas encore terminé"
+
+RÈGLE CRITIQUE — RÉÉLECTION / NOUVEAU MANDAT :
+Si les données mentionnent une date de fin de PREMIER MANDAT mais aussi une réélection ou un NOUVEAU mandat débutant après cette date :
+- La fin du premier mandat ne signifie PAS que la personne a quitté la fonction
+- Si réélection confirmée (même implicitement par "second mandat", "réélu", "investi pour un nouveau mandat") → statut_mandat = "actif"
+- PIÈGE FRÉQUENT : "Président de 2020 à 2025" + "réélu en 2025 pour un second mandat" → actif en 2026
+- Ne conclure ex_pep que si les données indiquent explicitement qu'un SUCCESSEUR a pris ses fonctions ou que la personne a quitté le pouvoir définitivement
 
 RÈGLES :
 1. Si le nom apparaît dans les données avec une fonction → est_pep selon périmètre
-2. Fonction dans le périmètre + confirmée encore active en {annee} → est_pep = true, statut_mandat = "actif"
-3. Toutes les fonctions connues terminées avant {annee} ET aucune nouvelle → est_pep = true, statut_mandat = "ex_pep"
+2. Fonction dans le périmètre + date_fin SUPÉRIEURE à {date_today} (ou pas de date_fin) → est_pep = true, statut_mandat = "actif"
+3. Toutes les fonctions connues avec date_fin INFÉRIEURE à {date_today} ET aucune nouvelle fonction → est_pep = true, statut_mandat = "ex_pep"
 4. Nom absent ou aucune fonction → est_pep = false
 5. Source officielle obligatoire pour valider → source_validee = true seulement si URL officielle
 
@@ -1096,7 +1295,8 @@ def node_qualify(state: PEPState) -> PEPState:
             criteres=criteres_actifs,
             resultats=state["resultats_recherche"][:8000],
             bio_passages=bio_passages,
-            annee=datetime.now().year
+            annee=datetime.now().year,
+            date_today=datetime.now().strftime("%d/%m/%Y")
         )
         response = _llm_invoke(prompt)
         # Capturer prompt + réponse pour l'audit
@@ -1110,6 +1310,8 @@ def node_qualify(state: PEPState) -> PEPState:
         start = content.find("{"); end = content.rfind("}") + 1
         data = json.loads(content[start:end])
         est_pep = bool(data.get("est_pep", False))
+        # Mémoriser le raisonnement brut du LLM avant que les garde-codes le modifient
+        _raison_llm_initial = (data.get("raisonnement") or "").lower()
         print(f"  est_pep={est_pep} | {data.get('fonction') or 'non-PEP'}")
         est_pep               = bool(data.get("est_pep", False))
         fonction              = data.get("fonction") or ""
@@ -1140,6 +1342,123 @@ def node_qualify(state: PEPState) -> PEPState:
         lieu_naissance        = data.get("lieu_naissance") or ""
         nb_enfants            = data.get("nb_enfants")
         statut_matrimonial    = data.get("statut_matrimonial") or ""
+
+        # ── ENRICHISSEMENT WIKIPEDIA : champs bio vides sur PEP confirmé ─────
+        # Déclenché si est_pep=True MAIS fonctions_historiques ou naissance manquants
+        # (source officielle n'a souvent que l'info actuelle, pas la biographie)
+        _bio_incomplet = (
+            est_pep and
+            (not fonctions_historiques
+             or not date_naissance.strip()
+             or not lieu_naissance.strip())
+        )
+        if _bio_incomplet:
+            try:
+                import requests as _rq
+                _WIKI_UA = {"User-Agent": "ScreenEdge/1.0 (compliance@screenedge.ai)"}
+                _nom_complet = f"{state['prenom']} {state['nom']}"
+                # Nom court = premier prénom seulement + nom (ex: "Faure Gnassingbé" au lieu de "Faure Essozimina Gnassingbé")
+                _prenom_court = state['prenom'].split()[0]
+                _nom_court = f"{_prenom_court} {state['nom']}"
+                _nom_variantes = list(dict.fromkeys([_nom_complet, _nom_court]))
+                _wiki_text = ""
+                # Essai 1 : URL directe fr puis en, avec variantes du nom
+                for _nom_wiki_v in _nom_variantes:
+                    if _wiki_text:
+                        break
+                    for _lang in ("fr", "en"):
+                        _slug = _nom_wiki_v.replace(" ", "_")
+                        try:
+                            _rw = _rq.get(
+                                f"https://{_lang}.wikipedia.org/w/api.php",
+                                params={"action": "query", "titles": _slug,
+                                        "prop": "extracts", "explaintext": True,
+                                        "exsectionformat": "plain", "format": "json", "redirects": 1},
+                                headers=_WIKI_UA,
+                                timeout=12
+                            )
+                            for _p in _rw.json().get("query", {}).get("pages", {}).values():
+                                _txt = _p.get("extract", "") or ""
+                                if _txt and len(_txt) > 300 and str(_p.get("pageid", "")) != "-1":
+                                    _wiki_text = _txt
+                                    print(f"  [Wiki-bio] {_lang}.wikipedia '{_nom_wiki_v}' → {len(_wiki_text)} chars")
+                                    break
+                        except Exception:
+                            pass
+                        if _wiki_text:
+                            break
+                # Essai 2 : recherche Wikipedia avec nom court (meilleur match titre)
+                if not _wiki_text:
+                    try:
+                        _rs = _rq.get(
+                            "https://fr.wikipedia.org/w/api.php",
+                            params={"action": "query", "list": "search",
+                                    "srsearch": _nom_court, "srlimit": 5, "format": "json"},
+                            headers=_WIKI_UA,
+                            timeout=10
+                        )
+                        # Match : prénom court ET nom tous présents dans le titre
+                        _parts_min = [p.lower() for p in _nom_court.split() if len(p) > 2]
+                        for _sr in _rs.json().get("query", {}).get("search", []):
+                            _stitle = _sr.get("title", "")
+                            _stitle_low = _stitle.lower()
+                            if all(p in _stitle_low for p in _parts_min):
+                                try:
+                                    _rw2 = _rq.get(
+                                        "https://fr.wikipedia.org/w/api.php",
+                                        params={"action": "query", "titles": _stitle.replace(" ", "_"),
+                                                "prop": "extracts", "explaintext": True,
+                                                "exsectionformat": "plain", "format": "json", "redirects": 1},
+                                        headers=_WIKI_UA,
+                                        timeout=12
+                                    )
+                                    for _p2 in _rw2.json().get("query", {}).get("pages", {}).values():
+                                        _txt2 = _p2.get("extract", "") or ""
+                                        if _txt2 and len(_txt2) > 300:
+                                            _wiki_text = _txt2
+                                            print(f"  [Wiki-bio] recherche → '{_stitle}' ({len(_wiki_text)} chars)")
+                                            break
+                                except Exception:
+                                    pass
+                            if _wiki_text:
+                                break
+                    except Exception:
+                        pass
+
+                if _wiki_text:
+                    _nom_wiki = _nom_complet
+                    # Fonctions historiques
+                    if not fonctions_historiques:
+                        fonctions_historiques = _extraire_fonctions_historiques(
+                            state["prenom"], state["nom"], _wiki_text
+                        )
+                        if fonctions_historiques:
+                            print(f"  [Wiki-bio] {len(fonctions_historiques)} fonctions historiques extraites")
+                    # Date/lieu naissance si manquants
+                    if not date_naissance.strip() or not lieu_naissance.strip():
+                        _pb = (
+                            f"Extrait date_naissance et lieu_naissance de {_nom_wiki} "
+                            f"depuis ce texte Wikipedia.\n"
+                            f"Réponds UNIQUEMENT en JSON : "
+                            f'{{\"date_naissance\": \"JJ/MM/AAAA ou null\", \"lieu_naissance\": \"VILLE ou null\"}}\n\n'
+                            f"TEXTE :\n{_wiki_text[:6000]}"
+                        )
+                        try:
+                            _rb = _llm_invoke(_pb)
+                            _cb = _rb.content.strip()
+                            if "```" in _cb:
+                                _cb = _cb.split("```json")[1].split("```")[0] if "```json" in _cb else _cb.split("```")[1].split("```")[0]
+                            _db = json.loads(_cb[_cb.find("{"):_cb.rfind("}")+1])
+                            if not date_naissance.strip():
+                                date_naissance = _db.get("date_naissance") or ""
+                            if not lieu_naissance.strip():
+                                lieu_naissance = _db.get("lieu_naissance") or ""
+                            if date_naissance or lieu_naissance:
+                                print(f"  [Wiki-bio] né le {date_naissance} à {lieu_naissance}")
+                        except Exception:
+                            pass
+            except Exception as _we:
+                print(f"  [Wiki-bio] Erreur fetch : {_we}")
 
         # ── GARDE CODE 0 : Vérifier que la fonction est attribuée au bon nom ────
         # Évite la confusion avec homonymes / membres de famille
@@ -1188,6 +1507,43 @@ def node_qualify(state: PEPState) -> PEPState:
                     "Confirmer date de naissance OU lieu de naissance avant insertion.]"
                 )
                 print(f"  [GC0b] Nom ambigu ({state['prenom']} {state['nom']}) — discriminant manquant")
+
+        # ── GARDE CODE 0c : Anti-homonyme — le nom complet cherché doit être l'entité principale ─
+        # Cas cible : "Amadou Ouattara" → corpus parle d'"Alassane Amadou Ouattara" (Alassane = PEP)
+        if est_pep and not state.get("opensanctions_confirmed", False):
+            _prenom0 = _norm(state["prenom"].split()[0])
+            _nom0    = _norm(state["nom"].split()[0])
+            _corp0   = _norm(state.get("resultats_recherche", ""))
+            # Exclure les titres/fonctions des "autres prénoms" pour éviter les faux positifs
+            _STOP_GC0C = {"president", "ministre", "chef", "ancien", "general", "directeur",
+                          "gouverneur", "premier", "colonel", "vice", "ex", "feu", "ambassadeur"}
+            _autres_prenoms = re.findall(
+                r'\b([a-z]{3,})\s+(?:[a-z]+\s+)?' + re.escape(_nom0) + r'\b', _corp0
+            )
+            _autres = [p for p in _autres_prenoms
+                       if p != _prenom0 and not _prenom0.startswith(p) and not p.startswith(_prenom0)
+                       and p not in _STOP_GC0C]
+            # Chercher si prenom0 apparaît comme PREMIER prénom (pas prénom intermédiaire)
+            # Ex: "alassane amadou ouattara" → amadou est précédé par "e " (alpha+espace) → non-direct
+            _match_direct = False
+            for _m in re.finditer(re.escape(_prenom0) + r'\s+(?:[a-z]+\s+)?' + re.escape(_nom0) + r'\b', _corp0):
+                _s = _m.start()
+                if _s >= 2 and _corp0[_s - 1] == ' ' and _corp0[_s - 2].isalpha():
+                    continue  # Embedded dans un nom plus long (ex: "alassane amadou ouattara")
+                _match_direct = True
+                break
+            if (not _match_direct
+                    and len(_autres) >= 4
+                    and len(_corp0.split()) > 300
+                    and not (date_naissance.strip() or lieu_naissance.strip())):
+                est_pep = False
+                _dominant = max(set(_autres), key=_autres.count) if _autres else "?"
+                data["raisonnement"] = (
+                    f"'{state['prenom']} {state['nom']}' non trouvé en tête dans le corpus — "
+                    f"le nom '{state['nom']}' est principalement associé à '{_dominant}' ({len(_autres)}× occurrences). "
+                    f"Homonyme probable : vérifier manuellement."
+                )
+                print(f"  REJETÉ [GC0c] : '{state['prenom']} {state['nom']}' absent en tête — homonyme probable (dominant: {_dominant})")
 
         # ── NETTOYAGE FONCTION : supprimer articles/prénoms parasites ──────────
         if fonction:
@@ -1436,18 +1792,26 @@ def node_qualify(state: PEPState) -> PEPState:
                         print(f"  [Garde-code 5] Signal non confirmé → statut conservé : {statut_mandat}")
                 else:
                     # Faux négatif : LLM n'a pas trouvé de fonction → vérification approfondie
+                    _gc5_votes = state.get("_votes_pays", 4)
+                    _gc5_alerte_pays = (
+                        f"\n⚠️  ALERTE : Le pays d'identification est INCERTAIN ({_gc5_votes} vote(s) seulement). "
+                        f"Sois TRÈS prudent — n'élève PAS à PEP sauf preuve explicite et indiscutable.\n"
+                    ) if _gc5_votes <= 2 else ""
                     prompt_gc5 = (
                         f"ANNÉE COURANTE : {datetime.now().year}\n"
                         f"PAYS : {state['pays_nom']}\n"
                         f"PERSONNE : {state['prenom']} {state['nom']}\n\n"
-                        f"Des passages suggèrent que cette personne a occupé une haute fonction publique "
-                        f"et l'a quittée :\n{signal_txt}\n\n"
+                        f"Des passages contiennent des indices sur le statut de cette personne :\n{signal_txt}\n\n"
                         f"CRITÈRES PEP DU PAYS (extrait) :\n{state['criteres'][:600]}\n\n"
-                        f"RÈGLES :\n"
-                        f"- Si les passages associent '{state['nom']}' à 'président', 'premier ministre', "
-                        f"'ancien président', 'ex-président', 'former president' ou équivalent → was_pep = true\n"
+                        f"{_gc5_alerte_pays}"
+                        f"RÈGLES STRICTES :\n"
+                        f"- was_pep = true UNIQUEMENT si les passages décrivent EXPLICITEMENT que "
+                        f"'{state['prenom']} {state['nom']}' a EUX-MÊMES occupé la fonction "
+                        f"(ex: '{state['nom']} a quitté la présidence', '{state['nom']}, ancien premier ministre')\n"
+                        f"- PIÈGE À ÉVITER : si une AUTRE personne est citée comme 'ancien président' "
+                        f"ou 'former president' dans le même passage que '{state['nom']}', "
+                        f"ce n'est PAS une preuve que '{state['nom']}' est PEP → was_pep = false\n"
                         f"- Si was_pep = true → la personne reste PEP indéfiniment (duree_ex_pep='permanente')\n"
-                        f"- Extraire le titre de fonction depuis les passages\n"
                         f"- En cas de doute → was_pep = false\n\n"
                         f"Réponds UNIQUEMENT en JSON :\n"
                         f"{{\"was_pep\": true ou false, "
@@ -1521,7 +1885,25 @@ def node_qualify(state: PEPState) -> PEPState:
         #  - ou fonction identifiée dans corpus suffisant mais sources officielles inaccessibles
         gc6_sources_inaccessibles = bool(fonction_gc6_identifiee) and corpus_mots_gc6 > 300
 
+        # GC6 ne se déclenche PAS si le LLM a explicitement identifié
+        # le candidat comme non-politicien (sportif, association civile, etc.)
+        # → évite les faux positifs par collision de nom avec un homonyme PEP historique
+        _non_pep_explicite = any(kw in _raison_llm_initial for kw in [
+            "joueur", "footballeur", "athlète", "sportif",
+            "aucune fonction correspondant",
+            "n'apparait pas avec une fonction",
+            "n'est pas identifi",
+            "aucune fonction publique",
+            "association de soutien", "organisation non gouvernementale",
+            "société civile", "ong ",
+            "pas une personnalité politique",
+            "aucune source", "aucune information",
+        ])
+        if _non_pep_explicite:
+            print(f"  [GC6 BLOQUÉ] LLM a rejeté explicitement — pas de GC6 pour éviter faux positif homonyme")
+
         if (not est_pep
+                and not _non_pep_explicite
                 and state["code_iso"] != "XX"
                 and (corpus_mots_gc6 < 200 or state.get("opensanctions_confirmed", False)
                      or gc6_sources_inaccessibles)):
@@ -1899,19 +2281,68 @@ def verifier_pep_batch(candidats: list[tuple[str, str]]) -> list[PersonPEPReport
     Vérifie une liste de candidats avec un délai entre chaque personne
     pour respecter les quotas API (Tavily, Serper, OpenSanctions).
 
+    Déduplication à deux niveaux :
+      1. Doublon dans le batch courant → résultat réutilisé sans appel API.
+      2. Déjà vérifié dans les 24h (verification_audit) → résultat caché retourné.
+
     Args:
         candidats : liste de tuples (prenom, nom)
 
     Returns:
         liste de PersonPEPReport dans le même ordre
     """
+    from db_utils import query_one as _qone_dd
     rapports = []
     total = len(candidats)
+    _cache_batch: dict[str, PersonPEPReport] = {}
+
     for i, (prenom, nom) in enumerate(candidats, 1):
         print(f"\n{'▶'*55}")
         print(f"  CANDIDAT {i}/{total} : {prenom} {nom}")
         print(f"{'▶'*55}")
+
+        _cle = f"{prenom.strip().lower()}|{nom.strip().lower()}"
+
+        # Doublon intra-batch
+        if _cle in _cache_batch:
+            print(f"  [Dédup] {prenom} {nom} déjà traité dans ce batch — résultat réutilisé")
+            rapports.append(_cache_batch[_cle])
+            continue
+
+        # Vérification récente en base (24h, hors erreurs LLM)
+        _nom_complet = f"{prenom} {nom}"
+        try:
+            _recent = _qone_dd("""
+                SELECT code_iso, est_pep, motif FROM verification_audit
+                WHERE nom_complet = %s
+                  AND ts > NOW() - INTERVAL '24 hours'
+                  AND (motif IS NULL OR motif::text NOT LIKE '%%erreur_llm%%')
+                ORDER BY ts DESC LIMIT 1
+            """, (_nom_complet,))
+            if _recent:
+                _iso = _recent["code_iso"] or "XX"
+                _pays = _referentiel_json.get(_iso, {}).get("pays", "Pays non identifié")
+                print(f"  [Dédup] {_nom_complet} déjà vérifié dans les 24h "
+                      f"(pays={_iso}, pep={_recent['est_pep']}) — sauté")
+                _rapp = PersonPEPReport(
+                    nom=nom, prenom=prenom,
+                    pays=_pays, code_iso=_iso,
+                    est_pep=_recent["est_pep"],
+                    statut_mandat="inconnu",
+                    fonction=None, fonctions_historiques=None,
+                    date_nomination=None, date_fin_mandat=None,
+                    source_url="", source_type="audit_cache",
+                    raisonnement=f"[CACHE 24H] {(_recent.get('motif') or '')[:200]}",
+                    date_verification=datetime.now().strftime("%d/%m/%Y %H:%M"),
+                )
+                _cache_batch[_cle] = _rapp
+                rapports.append(_rapp)
+                continue
+        except Exception as _e:
+            print(f"  [Dédup] Vérification audit : {_e}")
+
         rapport = verifier_pep(prenom, nom)
+        _cache_batch[_cle] = rapport
         rapports.append(rapport)
         if i < total:
             print(f"\n  ⏳ Pause {_DELAI_INTER_PERSONNES}s entre candidats (quota API)...")
@@ -1928,12 +2359,20 @@ TÂCHE :
 2. Si oui → retourne son prénom et nom OFFICIELS complets (y compris les prénoms composés ou noms composés manquants).
 3. Si non ou incertain → retourne simplement prénom/nom dans le bon ordre onomastique.
 
-EXEMPLES :
-- prénom="faye" nom="bassirou" → {{"prenom": "Bassirou Diomaye", "nom": "Faye"}} (président du Sénégal)
-- prénom="benkirane" nom="abdelilah" → {{"prenom": "Abdelilah", "nom": "Benkirane"}}
-- prénom="sassou" nom="nguesso" → {{"prenom": "Denis", "nom": "Sassou Nguesso"}}
-- prénom="akhannouch" nom="aziz" → {{"prenom": "Aziz", "nom": "Akhannouch"}}
-- prénom="jean" nom="dupont" → {{"prenom": "Jean", "nom": "Dupont"}} (inconnu — ordre déjà correct)
+RÈGLE CRITIQUE ANTI-SUBSTITUTION (PRIORITÉ ABSOLUE) :
+Ne compléter que si {prenom} est le PREMIER PRÉNOM DE LA PERSONNE, pas un prénom intermédiaire ou second prénom.
+Si {prenom} correspond à un SECOND prénom d'une personnalité connue (pas son premier) → NE PAS compléter, retourner les valeurs d'entrée telles quelles.
+Exemples INTERDITS :
+- prénom="amadou" nom="ouattara" → INTERDIT de retourner "Alassane Amadou Ouattara" car "Amadou" est le 2e prénom d'Alassane Ouattara. Retourner {{"prenom": "Amadou", "nom": "Ouattara"}}.
+- prénom="oumar" nom="touré" → INTERDIT de retourner "Amadou Toumani Touré" car "Oumar" n'est pas ATT. Retourner {{"prenom": "Oumar", "nom": "Touré"}}.
+- prénom="toumani" nom="touré" → INTERDIT de retourner "Amadou Toumani Touré" car "Toumani" est le 2e prénom. Retourner {{"prenom": "Toumani", "nom": "Touré"}}.
+Si incertain → retourner les prénoms tels que fournis sans modification.
+
+EXEMPLES VALIDES :
+- prénom="faye" nom="bassirou" → {{"prenom": "Bassirou Diomaye", "nom": "Faye"}} (ordre inversé uniquement)
+- prénom="benkirane" nom="abdelilah" → {{"prenom": "Abdelilah", "nom": "Benkirane"}} (ordre inversé)
+- prénom="sassou" nom="nguesso" → {{"prenom": "Denis", "nom": "Sassou Nguesso"}} (prénom manquant évident)
+- prénom="jean" nom="dupont" → {{"prenom": "Jean", "nom": "Dupont"}} (inconnu — retourné tel quel)
 
 Réponds UNIQUEMENT en JSON valide :
 {{"prenom": "prénom(s) officiel(s)", "nom": "nom de famille officiel"}}"""
@@ -1948,6 +2387,13 @@ def _normaliser_nom(prenom: str, nom: str) -> tuple[str, str]:
         d = json.loads(c[s:e])
         p_norm = d.get("prenom", prenom).strip()
         n_norm = d.get("nom", nom).strip()
+        # HARD BLOCK anti-substitution : si le premier prénom retourné est différent de l'input
+        # ET ce n'est pas simplement un échange nom/prénom → rejeter la normalisation
+        def _n(s): return unicodedata.normalize("NFKD", s.split()[0].strip()).encode("ascii", "ignore").decode("ascii").lower()
+        _in_p0, _in_n0, _out_p0 = _n(prenom), _n(nom), _n(p_norm)
+        if _out_p0 != _in_p0 and _out_p0 != _in_n0:
+            print(f"  [Normalisation BLOQUÉE] {prenom} {nom} → {p_norm} {n_norm} : substitution illicite (1er prénom changé)")
+            return prenom, nom
         # Corriger doublon : si le nom est déjà dans le prénom, le retirer du prénom
         if n_norm and n_norm.lower() in p_norm.lower():
             p_norm = re.sub(re.escape(n_norm), '', p_norm, flags=re.IGNORECASE).strip()
@@ -1958,10 +2404,77 @@ def _normaliser_nom(prenom: str, nom: str) -> tuple[str, str]:
     except Exception:
         return prenom, nom
 
+def _persist_source_logs(nom_complet: str, code_iso: str) -> None:
+    """Persiste les logs de santé des sources dans source_health_log.
+    Envoie une notification dashboard pour chaque source officielle inaccessible."""
+    logs = get_url_logs()
+    if not logs:
+        return
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. Insérer tous les logs dans source_health_log
+                for log in logs:
+                    cur.execute("""
+                        INSERT INTO source_health_log
+                            (nom_verifie, code_iso, url, domaine, tier,
+                             statut, http_code, duree_ms, erreur, est_source_off)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        log["nom_verifie"], log["code_iso"],
+                        log["url"], log["domaine"], log["tier"],
+                        log["statut"], log["http_code"],
+                        log["duree_ms"], log["erreur"], log["est_source_off"],
+                    ))
+
+                # 2. Notification dashboard pour sources officielles KO
+                alertes = [
+                    l for l in logs
+                    if l["est_source_off"]
+                    and l["statut"] in ("timeout", "connexion_ko", "http_erreur", "erreur")
+                ]
+                if alertes:
+                    # Notifier tous les utilisateurs actifs
+                    cur.execute("SELECT id FROM utilisateurs WHERE statut = 'actif'")
+                    user_ids = [r["id"] for r in cur.fetchall()]
+                    for alerte in alertes:
+                        msg = (f"La source {alerte['domaine']} n'a pas répondu lors de la "
+                               f"vérification de {nom_complet} ({code_iso}). "
+                               f"Statut : {alerte['statut']}"
+                               + (f" — {alerte['erreur'][:120]}" if alerte["erreur"] else ""))
+                        for uid in user_ids:
+                            cur.execute("""
+                                INSERT INTO notifications
+                                    (utilisateur_id, type, titre, message,
+                                     entite_type, metadata)
+                                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                            """, (
+                                uid,
+                                "source_indisponible",
+                                f"Source inaccessible : {alerte['domaine']}",
+                                msg,
+                                "source_health",
+                                json.dumps({
+                                    "url":      alerte["url"],
+                                    "domaine":  alerte["domaine"],
+                                    "statut":   alerte["statut"],
+                                    "code_iso": code_iso,
+                                    "nom":      nom_complet,
+                                }),
+                            ))
+            conn.commit()
+        n_alertes = len(alertes) if alertes else 0
+        print(f"  [SourceLog] {len(logs)} URLs loguées | {n_alertes} alerte(s) dashboard")
+    except Exception as e:
+        print(f"  [SourceLog] Erreur persistance : {e}")
+
+
 def _log_verification_audit(prenom: str, nom: str, result: dict,
                             rapport: "PersonPEPReport", duree_ms: int) -> None:
     """Écrit une ligne dans verification_audit — traçabilité complète pour audit compliance."""
     try:
+        code_iso = result.get("code_iso", "XX")
+        _persist_source_logs(f"{prenom} {nom}", code_iso)
         cpt = get_compteur()
         execute("""
             INSERT INTO verification_audit (
@@ -1979,7 +2492,7 @@ def _log_verification_audit(prenom: str, nom: str, result: dict,
             )
         """, (
             f"{prenom} {nom}",
-            result.get("code_iso", "XX"),
+            code_iso,
             json.dumps({"confirmed": result.get("opensanctions_confirmed", False),
                         "source": result.get("source_url", "")}),
             _audit_llm.get("modele", ""),
@@ -1999,11 +2512,12 @@ def _log_verification_audit(prenom: str, nom: str, result: dict,
 def verifier_pep(prenom: str, nom: str, stocker: bool = True) -> PersonPEPReport:
     import time as _time
     _t0 = _time.time()
-    # Réinitialiser capture audit pour cette vérification
+    # Réinitialiser accumulateurs pour cette vérification
     _audit_llm["modele"] = _actifs[0] if _actifs else ""
     _audit_llm["prompt"] = ""
     _audit_llm["reponse"] = ""
     reset_compteur_personne()
+    reset_url_logs()
     prenom, nom = _normaliser_nom(prenom, nom)
     print(f"\n{'='*55}")
     print(f"VÉRIFICATION PEP : {prenom} {nom}")
@@ -2015,6 +2529,7 @@ def verifier_pep(prenom: str, nom: str, stocker: bool = True) -> PersonPEPReport
         "criteres": "", "resultats_recherche": "", "corpus_brut": "",
         "urls_officielles_trouvees": [], "urls_media_trouvees": [],
         "opensanctions_confirmed": False,
+        "_votes_pays": 0,
         "est_pep": False, "statut_mandat": "actif", "fonction": "", "fonctions_historiques": [],
         "date_nomination": "", "date_fin_mandat": "",
         "date_naissance": "", "lieu_naissance": "", "nb_enfants": None,
@@ -2024,12 +2539,48 @@ def verifier_pep(prenom: str, nom: str, stocker: bool = True) -> PersonPEPReport
         "dry_run": not stocker,
     }
 
-    result = pipeline_pep.invoke(state)
+    try:
+        result = pipeline_pep.invoke(state)
+    except Exception as _exc_pipeline:
+        _duree_ms = int((_time.time() - _t0) * 1000)
+        _msg_exc = str(_exc_pipeline).lower()
+        _est_quota = any(k in _msg_exc for k in ("rate_limit", "quota", "429", "exhausted", "tokens per day"))
+        print(f"  [Pipeline] Exception : {_exc_pipeline}")
+        if _est_quota:
+            print(f"  [Retry Queue] Quota LLM épuisé — mise en file d'attente pour {prenom} {nom}")
+            try:
+                from db_utils import execute as _exec_rq
+                _exec_rq("""
+                    INSERT INTO verification_retry_queue (prenom, nom, statut, detail_erreur)
+                    VALUES (%s, %s, 'en_attente', %s)
+                    ON CONFLICT DO NOTHING
+                """, (prenom, nom, str(_exc_pipeline)[:500]))
+            except Exception as _e_rq:
+                print(f"  [Retry Queue] Erreur INSERT : {_e_rq}")
+        return PersonPEPReport(
+            nom=nom, prenom=prenom,
+            pays="Pays non identifié", code_iso="XX",
+            est_pep=False,
+            statut_mandat="inconnu",
+            fonction=None, fonctions_historiques=None,
+            date_nomination=None, date_fin_mandat=None,
+            source_url="", source_type="erreur_pipeline",
+            raisonnement=f"[ERREUR PIPELINE] {'quota_llm_épuisé' if _est_quota else 'exception'}: {str(_exc_pipeline)[:300]}",
+            date_verification=datetime.now().strftime("%d/%m/%Y %H:%M"),
+        )
     _duree_ms = int((_time.time() - _t0) * 1000)
+
+    # Pays incertain pour les Non-PEP identifiés avec 1 seule source (votes ≤ 2)
+    _pays_final    = result["pays_nom"]
+    _code_iso_final = result["code_iso"]
+    if not result["est_pep"] and result.get("_votes_pays", 4) <= 2:
+        print(f"  → Non-PEP + pays incertain ({result.get('_votes_pays',0)} vote(s)) → pays réinitialisé à XX")
+        _pays_final    = "Pays non identifié"
+        _code_iso_final = "XX"
 
     rapport = PersonPEPReport(
         nom=nom, prenom=prenom,
-        pays=result["pays_nom"], code_iso=result["code_iso"],
+        pays=_pays_final, code_iso=_code_iso_final,
         est_pep=result["est_pep"],
         statut_mandat=result.get("statut_mandat", "actif"),
         fonction=result["fonction"] or None,
@@ -2143,6 +2694,64 @@ def stocker_rapport(rapport: PersonPEPReport) -> str:
         return f"Inséré : {_nom_complet}"
     except Exception as e:
         return f"Erreur : {e}"
+
+
+def relancer_verifications_impossibles(limite: int = 10) -> list[PersonPEPReport]:
+    """
+    Relance les vérifications en file d'attente (quota LLM épuisé lors de la collecte).
+    À appeler manuellement ou via cron une fois les quotas récupérés.
+
+    Args:
+        limite : nombre max de vérifications à relancer en une fois
+
+    Returns:
+        liste de PersonPEPReport pour les cas relancés
+    """
+    from db_utils import query_all as _qall_rq, execute as _exec_rq
+    try:
+        _en_attente = _qall_rq("""
+            SELECT id, prenom, nom, tentatives, max_tentatives
+            FROM verification_retry_queue
+            WHERE statut = 'en_attente'
+              AND (tentatives IS NULL OR tentatives < max_tentatives)
+            ORDER BY ts_echec ASC
+            LIMIT %s
+        """, (limite,))
+    except Exception as _e:
+        print(f"[Retry Queue] Lecture impossible : {_e}")
+        return []
+
+    if not _en_attente:
+        print("[Retry Queue] Aucune vérification en attente.")
+        return []
+
+    print(f"[Retry Queue] {len(_en_attente)} vérification(s) à relancer...")
+    rapports = []
+    for row in _en_attente:
+        _id, _prenom, _nom = row["id"], row["prenom"], row["nom"]
+        try:
+            _exec_rq("""
+                UPDATE verification_retry_queue
+                SET statut='en_cours', tentatives=COALESCE(tentatives,0)+1, ts_retry=NOW()
+                WHERE id=%s
+            """, (_id,))
+        except Exception:
+            pass
+        try:
+            rapport = verifier_pep(_prenom, _nom)
+            rapports.append(rapport)
+            _exec_rq("UPDATE verification_retry_queue SET statut='termine', ts_retry=NOW() WHERE id=%s", (_id,))
+        except Exception as _e_run:
+            print(f"[Retry Queue] Échec pour {_prenom} {_nom} : {_e_run}")
+            try:
+                _exec_rq("""
+                    UPDATE verification_retry_queue
+                    SET statut='en_attente', detail_erreur=%s, ts_retry=NOW()
+                    WHERE id=%s
+                """, (str(_e_run)[:500], _id))
+            except Exception:
+                pass
+    return rapports
 
 
 if __name__ == "__main__":

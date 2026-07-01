@@ -285,11 +285,11 @@
       "Dirigeants militaires",
       "Dirigeants d'entreprises publiques"
     ],
-    "famille_incluse": false,
-    "proches_associes": false,
+    "famille_incluse": true,
+    "proches_associes": true,
     "duree_ex_pep": "permanente",
     "reevaluation": "non précisée",
-    "def_pep_complet": "Selon les recommandations GAFI transposées localement : toute personne exerçant ou ayant exercé des fonctions publiques importantes, notamment membres du CNRD (Comité National du Rassemblement pour le Développement), gouvernement, Parlement (dissous), hauts fonctionnaires, dirigeants militaires et d'entreprises publiques."
+    "def_pep_complet": "Selon les recommandations GAFI transposées localement : toute personne exerçant ou ayant exercé des fonctions publiques importantes, notamment membres du CNRD (Comité National du Rassemblement pour le Développement), gouvernement, Parlement (dissous), hauts fonctionnaires, dirigeants militaires et d'entreprises publiques. Famille et proches inclus selon GAFI R12."
   },
   {
     "pays": "Togo",

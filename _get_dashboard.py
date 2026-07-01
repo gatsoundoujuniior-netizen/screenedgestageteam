@@ -1,0 +1,10 @@
+import paramiko, sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect("195.200.14.241", username="root", password="Abdelghan#2026", timeout=20)
+sftp = ssh.open_sftp()
+sftp.get("/root/screen_edge/dashboard_pep.py", r"C:\Users\pc\Downloads\Screen_edge\dashboard_pep.py")
+sftp.close()
+ssh.close()
+print("dashboard_pep.py téléchargé OK")

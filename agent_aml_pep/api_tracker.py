@@ -9,18 +9,18 @@ _DIR        = os.path.dirname(os.path.abspath(__file__))
 _USAGE_FILE = os.path.join(_DIR, "api_usage.json")
 
 LIMITES = {
-    "groq_1_appels_jour":          1_000,
-    "groq_2_appels_jour":          1_000,
-    "groq_3_appels_jour":          1_000,
-    "gemini_tokens_jour":      1_000_000,
+    "groq_1_tokens_jour":        500_000,  # Groq free tier: 500k tokens/day (TPD) par compte
+    "groq_2_tokens_jour":        500_000,
+    "groq_3_tokens_jour":        500_000,
+    "gemini_appels_jour":             20,  # Gemini 2.5-flash free: 20 req/jour
     "serper_appels_mois":          2_500,
-    "tavily_appels_jour":          1_000,   # Adapter selon ton plan : Free=40 | Starter=1000 | Basic=3000
+    "tavily_appels_jour":          1_000,  # Free=40 | Starter=1000 | Basic=3000
     "opensanctions_appels_mois":   2_000,
 }
 
 # Coût d'une vérification complète par API (calibré sur les runs réels)
-TAVILY_APPELS_PAR_VERIF = 12
-GROQ_APPELS_PAR_VERIF   = 10
+TAVILY_APPELS_PAR_VERIF  = 12
+GROQ_TOKENS_PAR_VERIF    = 15_000   # ~15k tokens/verif (identification + qualification)
 
 SEUIL_ALERTE   = 80
 SEUIL_CRITIQUE = 95
@@ -43,7 +43,7 @@ def _sauver(data: dict):
 
 
 def _tracker_groq_n(n: int, tokens_entree: int = 0, tokens_sortie: int = 0):
-    """Enregistre une utilisation pour le compte Groq n (1, 2 ou 3)."""
+    """Enregistre une utilisation réussie pour le compte Groq n (1, 2 ou 3)."""
     cle   = f"groq_{n}"
     data  = _charger()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -54,8 +54,44 @@ def _tracker_groq_n(n: int, tokens_entree: int = 0, tokens_sortie: int = 0):
     bloc["appels"]  = bloc.get("appels", 0) + 1
     data[cle]       = bloc
     _sauver(data)
-    _alerter(f"{cle}_appels", bloc["appels"], LIMITES[f"{cle}_appels_jour"],
-             f"requêtes Groq-{n} aujourd'hui")
+    _alerter(f"{cle}_tokens", bloc["tokens"], LIMITES[f"{cle}_tokens_jour"],
+             f"tokens Groq-{n} aujourd'hui")
+
+
+def enregistrer_quota_reel_groq(n: int, utilise: int, limite: int):
+    """Enregistre les vrais chiffres TPD extraits du message d'erreur Groq (429).
+    Appelé quand Groq renvoie 'Limit X, Used Y' dans son erreur TPD.
+    Met à jour api_usage.json pour que le dashboard reflète la vraie consommation."""
+    cle   = f"groq_{n}"
+    data  = _charger()
+    today = datetime.now().strftime("%Y-%m-%d")
+    bloc  = data.get(cle, {})
+    if bloc.get("date") != today:
+        bloc = {"date": today, "tokens": 0, "appels": 0}
+    # Mettre à jour avec les vrais tokens rapportés par l'API Groq
+    bloc["tokens"]      = max(bloc.get("tokens", 0), utilise)
+    bloc["tpd_reel"]    = utilise
+    bloc["tpd_limite"]  = limite
+    bloc["tpd_ts"]      = datetime.now().strftime("%H:%M")
+    data[cle]           = bloc
+    _sauver(data)
+    _alerter(f"{cle}_tokens", utilise, limite, f"tokens Groq-{n} (TPD réel API)")
+
+
+def enregistrer_quota_reel_gemini(utilise: int, limite: int):
+    """Enregistre les vrais chiffres de quota Gemini depuis l'erreur 429."""
+    data  = _charger()
+    today = datetime.now().strftime("%Y-%m-%d")
+    bloc  = data.get("gemini", {})
+    if bloc.get("date") != today:
+        bloc = {"date": today, "tokens": 0, "appels": 0}
+    bloc["appels"]      = max(bloc.get("appels", 0), utilise)
+    bloc["tpd_reel"]    = utilise
+    bloc["tpd_limite"]  = limite
+    bloc["tpd_ts"]      = datetime.now().strftime("%H:%M")
+    data["gemini"]      = bloc
+    _sauver(data)
+    _alerter("gemini_appels", utilise, limite, "requêtes Gemini aujourd'hui")
 
 
 def tracker_groq_1(tokens_entree: int = 0, tokens_sortie: int = 0):
@@ -134,11 +170,8 @@ def _alerter(api: str, utilise: int, limite: int, label: str):
 
 
 def quota_restant_verifications() -> dict:
-    """
-    Calcule combien de vérifications PEP complètes peuvent encore être lancées aujourd'hui.
-    Le facteur limitant est le min(tavily, groq).
-    """
-    data  = _charger()
+    """Calcule combien de vérifications restantes aujourd'hui (facteur: min tavily, groq)."""
+    data = _charger()
 
     tav       = data.get("tavily", {})
     t_utilise = tav.get("appels", 0)
@@ -146,31 +179,35 @@ def quota_restant_verifications() -> dict:
     t_restant = max(0, t_limite - t_utilise)
     verifs_tavily = t_restant // TAVILY_APPELS_PAR_VERIF
 
-    g1        = data.get("groq_1", {})
-    g_utilise = g1.get("appels", 0)
-    g_limite  = LIMITES["groq_1_appels_jour"]
-    g_restant = max(0, g_limite - g_utilise)
-    verifs_groq = g_restant // GROQ_APPELS_PAR_VERIF
+    # Groq : prendre le compte avec le PLUS de tokens restants (meilleure capacité dispo)
+    g_limite = LIMITES["groq_1_tokens_jour"]  # identique pour les 3 comptes
+    g_best_restant = 0
+    for n in [1, 2, 3]:
+        b = data.get(f"groq_{n}", {})
+        used = b.get("tpd_reel", b.get("tokens", 0))
+        restant = max(0, g_limite - used)
+        g_best_restant = max(g_best_restant, restant)
+    verifs_groq = g_best_restant // GROQ_TOKENS_PAR_VERIF
 
-    verifs_max      = min(verifs_tavily, verifs_groq)
+    verifs_max       = min(verifs_tavily, verifs_groq)
     facteur_limitant = "tavily" if verifs_tavily <= verifs_groq else "groq"
 
     return {
         "verifications_restantes": verifs_max,
         "facteur_limitant":        facteur_limitant,
         "tavily": {
-            "utilise":  t_utilise,
-            "limite":   t_limite,
-            "restant":  t_restant,
-            "verifs":   verifs_tavily,
-            "pct":      round(t_utilise / t_limite * 100, 1) if t_limite else 0,
+            "utilise": t_utilise,
+            "limite":  t_limite,
+            "restant": t_restant,
+            "verifs":  verifs_tavily,
+            "pct":     round(t_utilise / t_limite * 100, 1) if t_limite else 0,
         },
         "groq": {
-            "utilise":  g_utilise,
-            "limite":   g_limite,
-            "restant":  g_restant,
-            "verifs":   verifs_groq,
-            "pct":      round(g_utilise / g_limite * 100, 1) if g_limite else 0,
+            "utilise": g_limite - g_best_restant,
+            "limite":  g_limite,
+            "restant": g_best_restant,
+            "verifs":  verifs_groq,
+            "pct":     round((g_limite - g_best_restant) / g_limite * 100, 1) if g_limite else 0,
         },
     }
 
@@ -185,15 +222,20 @@ def lire_consommation() -> dict:
     def _groq_bloc(n):
         b      = data.get(f"groq_{n}", {})
         appels = b.get("appels", 0)
-        limite = LIMITES[f"groq_{n}_appels_jour"]
+        tokens = b.get("tokens", 0)
+        # tokens_reel : valeur réelle extraite du message d'erreur TPD (plus fiable)
+        tokens_reel = b.get("tpd_reel", tokens)
+        limite = LIMITES[f"groq_{n}_tokens_jour"]
         date   = b.get("date", "—")
+        tpd_ts = b.get("tpd_ts", "")
         return {
-            "label":   f"Groq-{n} (llama-4-scout) — req/jour",
-            "utilise": appels,
+            "label":   f"Groq-{n} (llama-4-scout) — tokens/jour",
+            "utilise": tokens_reel,
             "appels":  appels,
             "limite":  limite,
-            "pct":     _pct(appels, limite),
+            "pct":     _pct(tokens_reel, limite),
             "periode": date,
+            "tpd_ts":  tpd_ts,  # heure du dernier hit TPD
         }
 
     gem   = data.get("gemini", {})
@@ -201,23 +243,24 @@ def lire_consommation() -> dict:
     tav   = data.get("tavily", {})
     osanc = data.get("opensanctions", {})
 
-    gm_tokens = gem.get("tokens", 0)
-    gm_appels = gem.get("appels", 0)
-    s_appels  = serp.get("appels", 0)
-    t_appels  = tav.get("appels", 0)
-    o_appels  = osanc.get("appels", 0)
+    gm_appels     = gem.get("appels", 0)
+    gm_appels_reel = gem.get("tpd_reel", gm_appels)  # vrais chiffres depuis erreur API
+    s_appels      = serp.get("appels", 0)
+    t_appels      = tav.get("appels", 0)
+    o_appels      = osanc.get("appels", 0)
 
     return {
         "groq_1":        _groq_bloc(1),
         "groq_2":        _groq_bloc(2),
         "groq_3":        _groq_bloc(3),
         "gemini": {
-            "label":   "Gemini (fallback) — tokens/jour",
-            "utilise": gm_tokens,
+            "label":   "Gemini 2.5-flash — req/jour",
+            "utilise": gm_appels_reel,
             "appels":  gm_appels,
-            "limite":  LIMITES["gemini_tokens_jour"],
-            "pct":     _pct(gm_tokens, LIMITES["gemini_tokens_jour"]),
+            "limite":  LIMITES["gemini_appels_jour"],
+            "pct":     _pct(gm_appels_reel, LIMITES["gemini_appels_jour"]),
             "periode": gem.get("date", "—"),
+            "tpd_ts":  gem.get("tpd_ts", ""),
         },
         "serper": {
             "label":   "Serper — requêtes/mois",

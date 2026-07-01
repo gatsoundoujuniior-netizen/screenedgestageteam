@@ -8,7 +8,7 @@ Hiérarchie des sources :
   Tier 3 — Référence compliance: OpenSanctions, OCCRP, FATF → alerte/enrichissement seulement
 """
 
-import sys, re, json, unicodedata
+import sys, re, json, unicodedata, time as _time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -23,6 +23,33 @@ load_dotenv(override=True)
 import os as _os
 _LOG_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "logs")
 _os.makedirs(_LOG_DIR, exist_ok=True)
+
+# ── Accumulateur de santé des sources (réinitialisé à chaque verifier_pep) ──────
+_url_logs: list[dict] = []
+
+def reset_url_logs() -> None:
+    global _url_logs
+    _url_logs = []
+
+def get_url_logs() -> list[dict]:
+    return list(_url_logs)
+
+def _log_url(url: str, tier: str, nom: str, code_iso: str,
+             statut: str, http_code=None, duree_ms: int = 0, erreur: str = "") -> None:
+    from urllib.parse import urlparse as _up
+    domaine = _up(url).netloc.replace("www.", "")
+    _url_logs.append({
+        "url":          url,
+        "domaine":      domaine,
+        "tier":         tier,
+        "nom_verifie":  nom,
+        "code_iso":     code_iso,
+        "statut":       statut,          # ok | vide | timeout | connexion_ko | http_erreur | bloque | erreur
+        "http_code":    http_code,
+        "duree_ms":     duree_ms,
+        "erreur":       (erreur or "")[:300],
+        "est_source_off": est_source_officielle(url),
+    })
 
 def _log_source_erreur(nom_complet: str, source: str, erreur: str) -> None:
     """Ajoute une ligne d'erreur source dans le log corpus du jour."""
@@ -138,43 +165,37 @@ DOMAINES_OFFICIELS = TIER1_DOMAINES
 
 DOMAINES_OFFICIELS_PAR_PAYS = {
     "MA": [
-        # Tier 1 — gouvernement.ma et jo.gov.ma inaccessibles (DNS fail)
         "maroc.ma", "cg.gov.ma", "parlement.ma",
         "chambredesrepresentants.ma", "chambredesconseillers.ma",
-        "bkam.ma", "utrf.gov.ma", "ammc.ma", "acaps.ma",
+        "utrf.gov.ma", "acaps.ma",
     ],
     "DZ": [
-        "el-mouradia.dz", "premier-ministre.gov.dz",
-        "apn.dz", "senat.dz",
-        "bank-of-algeria.dz", "ctrf.gov.dz", "joradp.dz",
+        "premier-ministre.gov.dz", "joradp.dz", "apn.dz",
     ],
     "TN": [
-        "carthage.tn", "gouvernement.tn", "arp.tn",
-        "bct.gov.tn", "ctaf.gov.tn", "jo.gov.tn",
+        "carthage.tn", "arp.tn", "ctaf.gov.tn",
     ],
     "LY": [
-        "gov.ly", "hor.ly", "cbl.gov.ly", "fiulibya.gov.ly",
+        "cbl.gov.ly",
     ],
     "SN": [
         "presidence.sn", "bceao.int",
-        # gouvernement.sn, assemblee-nationale.sn, centif.sn, jo.gouv.sn inaccessibles
     ],
     "CI": [
-        "presidence.ci", "gouv.ci", "assemblee-nationale.ci", "senat.ci",
-        "centif-ci.ci", "jo.ci", "aip.ci",
+        "presidence.ci", "gouv.ci", "senat.ci", "aip.ci", "pulse.ci",
         "bceao.int",
     ],
     "ML": [
-        "koulouba.ml", "primature.gov.ml", "amap.ml",
+        "koulouba.ml", "amap.ml",
         "bceao.int",
     ],
     "BF": [
         "gouvernement.gov.bf", "sig.gov.bf", "centif.bf",
-        "aib.bf", "fasonet.bf",
+        "fasonet.bf", "presidencedufaso.bf",
         "bceao.int",
     ],
     "NE": [
-        "presidence.ne", "gouv.ne", "centif.ne", "anp.ne",
+        "centif.ne", "anp.ne",
         "bceao.int",
     ],
     "TG": [
@@ -184,11 +205,11 @@ DOMAINES_OFFICIELS_PAR_PAYS = {
     ],
     "BJ": [
         "presidence.bj", "gouv.bj", "assemblee-nationale.bj",
-        "centif.bj", "jo.gouv.bj", "abp.bj",
+        "centif.bj", "portailinfo.bj",
         "bceao.int",
     ],
     "GW": [
-        "gov.gw", "bceao.int",
+        "bceao.int",
     ],
     "GN": [
         "presidence.gov.gn", "gouvernement.gov.gn", "bcrg.org",
@@ -336,7 +357,7 @@ def extraire_passages_nom(contenu: str, nom_complet: str) -> str:
 
 # ── TOOL 2 : Scrapling structuré — extraction JSON depuis pages officielles ─────
 
-def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
+def scraper_json_officiel(nom_complet: str, urls: list[str], code_iso: str = "") -> dict:
     """
     Scrapling lit une page officielle et extrait les données structurées
     (tableaux, listes) en JSON — pas du texte brut.
@@ -371,57 +392,66 @@ def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
     except Exception:
         pass
 
-    def _fetch_page(url: str) -> str:
-        """Fetch HTML d'une page — JS rendu via DynamicFetcher, fallback StealthyFetcher puis requests."""
-        # 1. DynamicFetcher — exécute JS, ignore SSL invalide
+    def _fetch_page(url: str) -> tuple:
+        """Fetch HTML — DynamicFetcher → StealthyFetcher → requests.
+        Retourne (html, statut, http_code, erreur)."""
+        # 1. DynamicFetcher
         if _dynamic_fetcher:
             try:
                 page = _dynamic_fetcher.fetch(url, wait=2000, ignore_https_errors=True)
                 html = str(page.html_content) if hasattr(page, 'html_content') else ""
                 if html and len(html) > 500:
-                    return html
+                    return html, "ok", 200, ""
             except Exception:
                 pass
-        # 2. StealthyFetcher — anti-détection, sans wait JS
+        # 2. StealthyFetcher
         if _stealthy_fetcher:
             try:
                 page = _stealthy_fetcher.fetch(url)
                 html = str(page.html_content) if hasattr(page, 'html_content') else ""
                 if html and len(html) > 500:
-                    return html
+                    return html, "ok", 200, ""
             except Exception:
                 pass
         # 3. requests simple
-        r = requests.get(url, timeout=10, verify=False, headers={"User-Agent": "Mozilla/5.0"})
-        return r.text
+        try:
+            r = requests.get(url, timeout=10, verify=False, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code >= 500:
+                return "", "http_erreur", r.status_code, f"HTTP {r.status_code}"
+            if r.status_code == 403:
+                return r.text, "bloque", 403, "HTTP 403 Forbidden"
+            if len(r.text) < 500:
+                return r.text, "vide", r.status_code, "contenu trop court"
+            return r.text, "ok", r.status_code, ""
+        except Exception as _fe:
+            _fe_s = str(_fe).lower()
+            if "timeout" in _fe_s or "timed out" in _fe_s:
+                return "", "timeout", None, str(_fe)[:200]
+            if "connection" in _fe_s or "refused" in _fe_s or "resolve" in _fe_s or "name or service" in _fe_s:
+                return "", "connexion_ko", None, str(_fe)[:200]
+            return "", "erreur", None, str(_fe)[:200]
 
     for url in urls:
-        # Wikipedia : API officielle — texte propre sans HTML, sans Tavily
+        # Wikipedia — déjà chargé par _run_wiki_api() dans rechercher_pep() → skip ici
+        # pour ne pas bloquer le scraping des URLs médias qui suivent dans la liste
         if "wikipedia.org/wiki/" in url:
-            try:
-                import requests as _rq
-                _titre_wiki = url.split("/wiki/")[-1]
-                _lang       = "fr" if "fr.wikipedia" in url else "en"
-                _api_url    = f"https://{_lang}.wikipedia.org/w/api.php"
-                _rw = _rq.get(_api_url, params={
-                    "action": "query", "titles": _titre_wiki,
-                    "prop": "extracts", "explaintext": True,
-                    "exsectionformat": "plain", "format": "json", "redirects": 1,
-                }, timeout=10, headers={"User-Agent": "PEPAgent/1.0"})
-                _pages = _rw.json().get("query", {}).get("pages", {})
-                _page  = next(iter(_pages.values()))
-                _texte_wiki_api = _page.get("extract", "")
-                if _texte_wiki_api and any(p in _texte_wiki_api.lower() for p in nom_parts):
-                    print(f"  Wikipedia API OK — {len(_texte_wiki_api)} chars / {len(_texte_wiki_api.split())} mots")
-                    return {"source": url, "texte_brut": _texte_wiki_api[:15000]}
-            except Exception as _ew:
-                print(f"  Wikipedia API erreur : {_ew}")
             continue
 
-        if not est_source_officielle(url):
+        _can_scrape = (
+            est_source_officielle(url)
+            or est_source_secondaire(url)
+            or any(d in url.lower() for d in ["britannica.com", "notreafrik.com"])
+        )
+        if not _can_scrape:
             continue
+        _tier_scrape = "scrapling" if est_source_officielle(url) else "scrapling_media"
+        _t_url = _time.time()
         try:
-            html_str = _fetch_page(url)
+            html_str, _statut_url, _http_url, _erreur_url = _fetch_page(url)
+            _duree_url = int((_time.time() - _t_url) * 1000)
+            _log_url(url, _tier_scrape, nom_complet, code_iso, _statut_url, _http_url, _duree_url, _erreur_url)
+            if not html_str or len(html_str) < 200:
+                continue
             soup     = BeautifulSoup(html_str, "html.parser")
 
             nominations = []
@@ -569,6 +599,8 @@ def scraper_json_officiel(nom_complet: str, urls: list[str]) -> dict:
                 return {"source": url, "texte_brut": extrait[:6000]}
 
         except Exception as e:
+            _duree_url = int((_time.time() - _t_url) * 1000)
+            _log_url(url, "scrapling", nom_complet, code_iso, "erreur", None, _duree_url, str(e)[:200])
             print(f"  Scrapling erreur {url[:50]} : {e}")
             continue
 
@@ -642,16 +674,25 @@ def recherche_tavily(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pe
             except Exception:
                 pass
 
-    # Tier 2 — toujours interrogé (pas seulement en fallback)
-    # Pas de contrainte d'année — couvre aussi les ex-PEP (coups, démissions, retraites passées)
-    for site in ["rfi.fr", "afp.com", "jeuneafrique.com", "reuters.com"]:
+    # Tier 2 médias — si peu de sources officielles, interroger tous les médias + extraire URLs pour Scrapling
+    _SITES_MEDIA_T2 = ["rfi.fr", "france24.com", "jeuneafrique.com", "afp.com"]
+    _corpus_thin = len(urls_officielles) < 2
+    _media_hits = 0
+    for site in _SITES_MEDIA_T2:
         try:
-            res = _tavily_invoke(tavily, f'site:{site} "{nom_complet}" fonction OR président OR ministre OR ancien', f"media: {site}")
+            res = _tavily_invoke(tavily, f'site:{site} "{nom_complet}" président OR ministre OR actuel {annee}', f"media: {site}")
             if res:
                 texte = str(res)
                 if any(p in texte.lower() for p in nom_parts):
                     resultats_bruts.append(f"[MEDIA TIER2 — {site}]\n{texte}")
-                    break
+                    # Extraire les URLs articles pour Scrapling profond (plein article, pas juste snippet)
+                    for _mu in re.findall(r'https?://[^\s\'">,\]]+', texte):
+                        _mu = _mu.rstrip('.,)')
+                        if site in _mu and _mu not in urls_officielles:
+                            urls_officielles.append(_mu)
+                    _media_hits += 1
+                    if not _corpus_thin and _media_hits >= 1:
+                        break  # 1 média suffit pour les pays bien couverts en sources officielles
         except Exception:
             continue
 
@@ -674,6 +715,8 @@ def rechercher_google(nom_complet: str, pays_nom: str, code_iso: str) -> tuple[s
     """
     import os, requests as req_g
     api_key = os.getenv("serper_dev_aoi_key", "")
+    _serper_key_2 = os.getenv("serper_dev_aoi_key_2", "")
+    _serper_key_3 = os.getenv("serper_dev_aoi_key_3", "")
     if not api_key:
         print(f"  [Tier 2b] Serper — clé manquante → ignoré")
         return "", [], []
@@ -682,7 +725,9 @@ def rechercher_google(nom_complet: str, pays_nom: str, code_iso: str) -> tuple[s
 
     _DOMAINES_MEDIA_FIABLES = {
         "rfi.fr", "afp.com", "jeuneafrique.com", "reuters.com", "lemonde.fr",
-        "lefigaro.fr", "bbc.com", "apanews.net", "africanews.com", "voaafrique.com",
+        "lefigaro.fr", "bbc.com", "france24.com", "apanews.net", "africanews.com",
+        "voaafrique.com", "britannica.com", "notreafrik.com", "weforum.org", "dw.com",
+        "afrique-sur7.fr", "afrik.com",
         "telquel.ma", "le360.ma", "medias24.com", "hespress.com", "map.ma",
         "leral.net", "pressafrik.com", "dakaractu.com", "seneweb.com",
         "aip.ci", "fratmat.info", "koaci.com", "connectionivoirienne.net",
@@ -697,49 +742,85 @@ def rechercher_google(nom_complet: str, pays_nom: str, code_iso: str) -> tuple[s
     def _est_media_fiable(url: str) -> bool:
         return any(d in url.lower() for d in _DOMAINES_MEDIA_FIABLES)
 
+    # Nom court = premier prénom + nom (sans prénom intermédiaire)
+    # Ex: "Faure Essozimina Gnassingbé" → "Faure Gnassingbé"
+    _parts_nom = nom_complet.split()
+    _nom_court = f"{_parts_nom[0]} {_parts_nom[-1]}" if len(_parts_nom) > 2 else nom_complet
+
     requetes_principales = [
         f'"{nom_complet}" président OR ministre {pays_nom}',
         f'"{nom_complet}" ancien président OR ex-président {pays_nom}',
     ]
+    # Fallback sans prénom intermédiaire (ex: "Faure Essozimina Gnassingbé" → "Faure Gnassingbé")
+    requetes_fallback = [
+        f'"{_nom_court}" président OR ministre {pays_nom}',
+        f'{_nom_court} président OR ministre {pays_nom}',
+    ] if _nom_court != nom_complet else []
 
     resultats_bruts  = []
     urls_officielles = []
     urls_medias      = []
 
-    for q in requetes_principales:
-        try:
-            r = req_g.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
-                json={"q": q, "hl": "fr", "num": 10},
-                timeout=8,
-            )
-            _tracker_serper(nb_appels=1)
-            if r.status_code != 200:
-                print(f"  [Tier 2b] Serper HTTP {r.status_code}")
-                continue
-            items = r.json().get("organic", [])
-            if not items:
+    def _run_serper_queries(queries: list) -> None:
+        for q in queries:
+            try:
+                r = req_g.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                    json={"q": q, "hl": "fr", "num": 10},
+                    timeout=8,
+                )
+                _tracker_serper(nb_appels=1)
+                if r.status_code != 200:
+                    # Cascade fallback clé-2 → clé-3 si quota épuisé (400, 429, 403)
+                    _fallback_ok = False
+                    if r.status_code in (400, 429, 403):
+                        for _fb_num, _fb_key in [("2", _serper_key_2), ("3", _serper_key_3)]:
+                            if not _fb_key:
+                                continue
+                            _rf = req_g.post(
+                                "https://google.serper.dev/search",
+                                headers={"X-API-KEY": _fb_key, "Content-Type": "application/json"},
+                                json={"q": q, "hl": "fr", "num": 10},
+                                timeout=8,
+                            )
+                            if _rf.status_code == 200:
+                                r = _rf
+                                print(f"  [Tier 2b] Serper clé-{_fb_num} fallback OK")
+                                _fallback_ok = True
+                                break
+                            else:
+                                print(f"  [Tier 2b] Serper clé-{_fb_num} HTTP {_rf.status_code}")
+                    if not _fallback_ok:
+                        print(f"  [Tier 2b] Serper HTTP {r.status_code} — toutes clés épuisées")
+                        continue
+                items = r.json().get("organic", [])
+                if not items:
+                    continue
+                parties_q = []
+                for item in items:
+                    url     = item.get("link", "")
+                    titre   = item.get("title", "")
+                    snippet = item.get("snippet", "")
+                    texte   = f"{url}\n{titre}\n{snippet}"
+                    if any(p in texte.lower() for p in nom_parts):
+                        parties_q.append(texte)
+                        if est_source_officielle(url):
+                            urls_officielles.append(url)
+                        elif _est_media_fiable(url) and url not in urls_medias:
+                            urls_medias.append(url)
+                if parties_q:
+                    resultats_bruts.append("[SERPER/GOOGLE]\n" + "\n\n".join(parties_q))
+            except Exception as e:
+                print(f"  [Tier 2b] Serper erreur : {e}")
                 continue
 
-            parties_q = []
-            for item in items:
-                url     = item.get("link", "")
-                titre   = item.get("title", "")
-                snippet = item.get("snippet", "")
-                texte   = f"{url}\n{titre}\n{snippet}"
-                if any(p in texte.lower() for p in nom_parts):
-                    parties_q.append(texte)
-                    if est_source_officielle(url):
-                        urls_officielles.append(url)
-                    elif _est_media_fiable(url) and url not in urls_medias:
-                        urls_medias.append(url)
+    _run_serper_queries(requetes_principales)
 
-            if parties_q:
-                resultats_bruts.append("[SERPER/GOOGLE]\n" + "\n\n".join(parties_q))
-        except Exception as e:
-            print(f"  [Tier 2b] Serper erreur : {e}")
-            continue
+    # Fallback nom court si nom complet avec guillemets retourne 0
+    if not resultats_bruts and requetes_fallback:
+        print(f"  [Tier 2b] Serper fallback → '{_nom_court}'")
+        _run_serper_queries(requetes_fallback)
 
     if not resultats_bruts:
         print(f"  [Tier 2b] Serper — 0 résultat pertinent")
@@ -808,6 +889,19 @@ def rechercher_opensanctions(nom_complet: str, code_iso: str = "") -> dict:
             return {}
         data = r.json()
         resultats = data.get("results", [])
+        # Fallback nom court si 0 résultat avec nom complet (prénom intermédiaire)
+        _parts_os = nom_complet.split()
+        if not resultats and len(_parts_os) > 2:
+            _nom_court_os = f"{_parts_os[0]} {_parts_os[-1]}"
+            print(f"  [Tier 3] OpenSanctions fallback → '{_nom_court_os}'")
+            params["q"] = _nom_court_os
+            r2 = req_os.get(
+                "https://api.opensanctions.org/search/default",
+                params=params, timeout=10, headers=headers,
+            )
+            _tracker_opensanctions(nb_appels=1)
+            if r2.status_code == 200:
+                resultats = r2.json().get("results", [])
         if not resultats:
             print(f"  [Tier 3] OpenSanctions — 0 résultat pour {nom_complet}")
             return {}
@@ -837,7 +931,7 @@ def rechercher_opensanctions(nom_complet: str, code_iso: str = "") -> dict:
             date_debut = date_debut_raw[0] if date_debut_raw else None
             entite = {
                 "nom":        " ".join(props.get("name", [nom_complet])),
-                "pays":       props.get("country", [code_iso]),
+                "pays":       (props.get("country") or props.get("citizenship") or props.get("nationality") or ([code_iso] if code_iso != "XX" else ["XX"])),
                 "fonctions":  fonctions,
                 "topics":     topics,
                 "is_pep":     is_pep_topics or is_pep_fcts,
@@ -882,6 +976,23 @@ def rechercher_pep(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pep:
     _wiki_url    = f"https://fr.wikipedia.org/wiki/{_wiki_slug}"
     extrait_wiki = ""
     texte_wiki   = ""
+
+    # Britannica + notreafrik + Jeune Afrique — slug court (premier prénom + nom, sans accents)
+    import unicodedata as _ud2
+    def _to_bio_slug(text: str, title_case: bool = False) -> str:
+        nfkd = _ud2.normalize("NFKD", text)
+        ascii_t = nfkd.encode("ascii", "ignore").decode("ascii")
+        parts = ascii_t.split()
+        if title_case:
+            return "-".join(p.capitalize() for p in parts)
+        return "-".join(p.lower() for p in parts)
+    _parts_nc      = nom_complet.split()
+    _nom_court_bio = f"{_parts_nc[0]} {_parts_nc[-1]}" if len(_parts_nc) > 2 else nom_complet
+    _bio_slug_low  = _to_bio_slug(_nom_court_bio, title_case=False)   # faure-gnassingbe
+    _bio_slug_cap  = _to_bio_slug(_nom_court_bio, title_case=True)    # Faure-Gnassingbe
+    _britannica_url   = f"https://www.britannica.com/biography/{_bio_slug_cap}"
+    _notreafrik_url   = f"https://notreafrik.com/{_bio_slug_low}"
+    _jeuneafrique_url = f"https://www.jeuneafrique.com/personnalites/{_bio_slug_low}/"
 
     # ── Tier 2b : Google Custom Search — thread principal ────────────────────────
     print(f"  [Tier 2b] Google — recherche web complémentaire...")
@@ -942,8 +1053,12 @@ def rechercher_pep(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pep:
 
     # URLs médias Serper ajoutées EN FIN de liste — Scrapling tente officiel d'abord
     urls_scraping = list(dict.fromkeys(
-        urls_pays + urls_discovery + urls_tavily + urls_google + urls_opensanctions + [_wiki_url] + urls_google_media
+        urls_pays + urls_discovery + urls_tavily + urls_google + urls_opensanctions
+        + [_wiki_url, _britannica_url, _notreafrik_url, _jeuneafrique_url] + urls_google_media
     ))
+    if urls_pays:
+        print(f"  [URLs off] {len(urls_pays)} sites officiels : {', '.join(u.replace('https://www.','').replace('https://','')[:35] for u in urls_pays)}")
+    print(f"  [Bio sources] britannica/{_bio_slug_cap} | notreafrik/{_bio_slug_low} | jeuneafrique/personnalites/{_bio_slug_low}")
     if urls_google_media:
         print(f"  [Serper médias] {len(urls_google_media)} articles médias injectés dans Scrapling : {urls_google_media[0][:60]}")
 
@@ -953,7 +1068,7 @@ def rechercher_pep(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pep:
         if not urls_scraping:
             return {}
         print(f"  [Tier 1] Scrapling — {len(urls_scraping)} URLs (pays:{len(urls_pays)} + Tavily:{len(urls_tavily)} + OS:{len(urls_opensanctions)})...")
-        return scraper_json_officiel(nom_complet, urls_scraping)
+        return scraper_json_officiel(nom_complet, urls_scraping, code_iso=code_iso)
 
     def _run_wiki_api():
         """Wikipedia API texte + extraction des liens officiels.
@@ -1135,8 +1250,15 @@ def rechercher_pep(nom_complet: str, pays_nom: str, code_iso: str, duree_ex_pep:
 
     # Tier 3 — OpenSanctions (complément compliance)
     if os_result.get("entites"):
+        # Marqueur structuré pour extraction pays sans regex fragile
+        _os_pays = []
+        for _ent in os_result["entites"]:
+            for _p in (_ent.get("pays") or []):
+                if isinstance(_p, str) and len(_p) == 2 and _p.upper() not in _os_pays:
+                    _os_pays.append(_p.upper())
+        _os_pays_tag = f"[OS_PAYS:{','.join(_os_pays) if _os_pays else 'XX'}]"
         entites_str = json.dumps(os_result["entites"], ensure_ascii=False, indent=2)
-        parties.append(f"=== TIER 3 — OPENSANCTIONS [COMPLIANCE✅] ===\n{entites_str}")
+        parties.append(f"=== TIER 3 — OPENSANCTIONS [COMPLIANCE✅] ===\n{_os_pays_tag}\n{entites_str}")
 
     if not parties:
         parties.append("Aucun résultat trouvé sur les sources Tier 1/2/3.")

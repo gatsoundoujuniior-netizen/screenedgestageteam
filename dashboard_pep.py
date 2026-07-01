@@ -421,115 +421,63 @@ if _api_usage:
     except Exception:
         pass
 
-    # Modèle LLM actif — lu depuis verification_audit (dernier modèle utilisé avec succès)
-    if not _llm_actif:
-        try:
-            from db_utils import query_one as _qone
-            _last = _qone("SELECT llm_modele FROM verification_audit WHERE llm_modele IS NOT NULL AND llm_modele != '' AND motif NOT ILIKE '%impossible%' ORDER BY ts DESC LIMIT 1")
-            if _last:
-                _llm_actif = _last.get("llm_modele", "")
-        except Exception:
-            pass
-
-    # Calcul agrégé Groq (3 comptes) — badge basé sur le MEILLEUR compte disponible
-    _groq_blocs = [_api_usage.get(f"groq_{n}", {}) for n in [1, 2, 3]]
-    _groq_pcts  = [b.get("pct", 0) for b in _groq_blocs]
-    _groq_utils = [b.get("utilise", 0) for b in _groq_blocs]
-    _groq_lim   = _groq_blocs[0].get("limite", 500_000)
-    _groq_min_pct = min(_groq_pcts)          # meilleur compte (le moins consommé)
-    _groq_max_pct = max(_groq_pcts)          # pire compte
-    _groq_dispo   = sum(1 for p in _groq_pcts if p < 100)  # nb comptes disponibles
-
     _api_cfg = [
-        ("gemini",        "✨ Gemini",         "gemini-2.5-flash", "req"),
-        ("groq_aggrege",  "🤖 Groq (×3)",      "llama-4-scout",    "tokens"),
-        ("serper",        "🔍 Serper",         "",                  "req"),
-        ("tavily",        "🌐 Tavily",         "",                  "req"),
-        ("opensanctions", "🛡️ OpenSanctions", "",                  "req"),
+        ("gemini",        "✨ Gemini",          "gemini-2.5-flash"),
+        ("groq_1",        "🤖 Groq",            "llama-4-scout"),
+        ("serper",        "🔍 Serper",          ""),
+        ("tavily",        "🌐 Tavily",          ""),
+        ("opensanctions", "🛡️ OpenSanctions",  ""),
     ]
 
-    for _col, (_key, _lbl, _model_name, _unite) in zip(_api_cols, _api_cfg):
-        if _key == "groq_aggrege":
-            # Agrégat des 3 comptes Groq
-            _pct  = _groq_min_pct   # % du meilleur compte (capacité réelle disponible)
-            _util = min(_groq_utils) # tokens du moins consommé
-            _lim  = _groq_lim
-            _per  = _groq_blocs[0].get("periode", "")
-            _apls = sum(b.get("appels", 0) for b in _groq_blocs)
-        else:
-            _d    = _api_usage.get(_key, {})
-            _pct  = _d.get("pct", 0)
-            _util = _d.get("utilise", 0)
-            _lim  = _d.get("limite", 0)
-            _per  = _d.get("periode", "")
-            _apls = _d.get("appels", 0)
+    for _col, (_key, _lbl, _model_name) in zip(_api_cols, _api_cfg):
+        _d = _api_usage.get(_key, {})
+        _pct  = _d.get("pct", 0)
+        _util = _d.get("utilise", 0)
+        _lim  = _d.get("limite", 0)
+        _per  = _d.get("periode", "")
+        _apls = _d.get("appels", 0)
 
-        if _key == "groq_aggrege":
-            if _groq_dispo == 0:
-                _badge = "🔴 ÉPUISÉ"
-            elif _groq_max_pct >= 95:
-                _badge = f"⚠️ {_groq_dispo}/3 dispo"
-            else:
-                _badge = f"✅ {_groq_dispo}/3 OK"
+        if _pct >= 100:
+            _badge = "🔴 ÉPUISÉ"
+        elif _pct >= 95:
+            _badge = "⛔ CRITIQUE"
+        elif _pct >= 80:
+            _badge = "⚠️ ALERTE"
         else:
-            if _pct >= 100:
-                _badge = "🔴 ÉPUISÉ"
-            elif _pct >= 95:
-                _badge = "⛔ CRITIQUE"
-            elif _pct >= 80:
-                _badge = "⚠️ ALERTE"
-            else:
-                _badge = "✅ OK"
+            _badge = "✅ OK"
 
-        # Tag modèle actif
+        # Indicateur modèle actif
         _actif_tag = ""
-        if _model_name and _llm_actif:
-            if _model_name.lower() in _llm_actif.lower():
-                if "groq" in _llm_actif.lower():
-                    _actif_tag = " 🟢"
-                else:
-                    _actif_tag = " 🟡"
+        if _model_name and _llm_actif and _model_name.lower() in _llm_actif.lower():
+            _actif_tag = " 🟢 **actif**"
+        elif _key == "groq_1" and _llm_actif and "groq" in _llm_actif.lower():
+            _actif_tag = " 🟢 **actif**"
+        elif _key == "gemini" and _llm_actif and "gemini" in _llm_actif.lower():
+            _actif_tag = " 🟡 **fallback actif**"
 
         with _col:
             st.markdown(f"**{_lbl}** &nbsp; {_badge}{_actif_tag}")
             if _model_name:
                 st.caption(f"_{_model_name}_")
             st.progress(min(_pct / 100, 1.0))
-            if _unite == "tokens":
-                st.caption(f"{_util:,} tok / {_lim:,} {_per} ({_pct}%)")
-                if _key == "groq_aggrege":
-                    _detail = " · ".join(f"G{i+1}:{p:.0f}%" for i, p in enumerate(_groq_pcts))
-                    st.caption(_detail)
-            elif _key == "gemini":
-                st.caption(f"{int(_util)} req / {_lim} {_per} ({_pct}%)")
-                if _apls:
-                    st.caption(f"{_apls} appels")
+            if _key == "gemini":
+                st.caption(f"{_util:,} tokens / {_lim:,} {_per} ({_pct}%)")
+                st.caption(f"{_apls} appels LLM")
+            elif _key == "groq_1":
+                st.caption(f"{_util:,} requêtes / {_lim:,} {_per} ({_pct}%)")
             else:
-                st.caption(f"{_util:,} req / {_lim:,} {_per} ({_pct}%)")
+                st.caption(f"{_util:,} requêtes / {_lim:,} {_per} ({_pct}%)")
 
-    # Alerte globale — inclut Groq agrégé
-    _epuises   = [k for k, d in _api_usage.items() if d.get("pct", 0) >= 100 and not k.startswith("groq_")]
-    _critiques = [k for k, d in _api_usage.items() if 95 <= d.get("pct", 0) < 100 and not k.startswith("groq_")]
-    _alertes   = [k for k, d in _api_usage.items() if 80 <= d.get("pct", 0) < 95 and not k.startswith("groq_")]
-    if _groq_dispo == 0:
-        _epuises.append("GROQ (3/3 épuisés)")
-    elif _groq_max_pct >= 95:
-        _critiques.append(f"GROQ ({3 - _groq_dispo}/3 compte(s) critique)")
+    # Alerte globale si une API est épuisée ou critique
+    _epuises   = [k for k, d in _api_usage.items() if d.get("pct", 0) >= 100]
+    _critiques = [k for k, d in _api_usage.items() if 95 <= d.get("pct", 0) < 100]
+    _alertes   = [k for k, d in _api_usage.items() if 80 <= d.get("pct", 0) < 95]
     if _epuises:
-        st.error(f"🔴 **QUOTA ÉPUISÉ** : {', '.join(str(e).upper() for e in _epuises)} — vérifications en file de retry.")
+        st.error(f"🔴 **QUOTA ÉPUISÉ** : {', '.join(e.upper() for e in _epuises)} — le système utilise les outils alternatifs jusqu'à la prochaine période.")
     if _critiques:
-        st.warning(f"⛔ **Quota critique** : {', '.join(str(c).upper() for c in _critiques)} — quelques appels restants.")
+        st.warning(f"⛔ **Quota critique** : {', '.join(c.upper() for c in _critiques)} — quelques appels restants, surveiller.")
     if not _epuises and not _critiques and _alertes:
-        st.warning(f"⚠️ **Quota bientôt atteint** : {', '.join(a.upper() for a in _alertes)}")
-
-    # File de retry — afficher si des vérifications sont en attente
-    try:
-        from db_utils import query_one as _qone_rq
-        _rq = _qone_rq("SELECT COUNT(*) as nb FROM verification_retry_queue WHERE statut='en_attente'")
-        if _rq and _rq.get("nb", 0) > 0:
-            st.warning(f"🔄 **{_rq['nb']} vérification(s) en file de retry** — quotas épuisés lors de la collecte. Relancer quand les quotas sont disponibles.")
-    except Exception:
-        pass
+        st.warning(f"⚠️ **Quota bientôt atteint** : {', '.join(a.upper() for a in _alertes)} — pensez à surveiller la consommation.")
 
     # ── Quota vérifications restantes ────────────────────────────────────────
     try:
@@ -606,22 +554,27 @@ def _charger_stats_couverture():
                 dump_par_pays[_code] = _cnt[0] if _cnt else 0
             _conn.close()
 
-        # Traités = noms UNIQUES passés par le pipeline (verification_audit), par pays
+        # Traités = noms passés par le pipeline (verification_audit), par pays
         rows_v = query_all("""
-            SELECT code_iso, COUNT(DISTINCT nom_complet) as nb
+            SELECT code_iso, COUNT(*) as nb
             FROM verification_audit
             WHERE llm_modele != 'track_b_official_source'
             GROUP BY code_iso
         """) or []
         traites_par_pays = {(r.get("code_iso") or "").upper(): r["nb"] for r in rows_v}
 
-        # PEP détectés = noms UNIQUES confirmés PEP via le pipeline (est_pep=true)
-        # Inclut les vérifications dry_run (stocker=False) qui ne sont pas dans la table pep
+        # ── Insérés depuis dump (confirmés par opensanctions OU source dump) ─
         rows_i = query_all("""
-            SELECT code_iso, COUNT(DISTINCT nom_complet) as nb
-            FROM verification_audit
-            WHERE est_pep = true
-            GROUP BY code_iso
+            SELECT p.code_iso, COUNT(*) as nb
+            FROM pep p
+            WHERE p.source_url ILIKE '%opensanctions%'
+               OR EXISTS (
+                   SELECT 1 FROM verification_audit va
+                   WHERE va.nom_complet = p.nom_complete
+                     AND va.code_iso = p.code_iso
+                     AND (va.opensanctions::jsonb->>'confirmed')::boolean = true
+               )
+            GROUP BY p.code_iso
         """) or []
         inseres = {(r.get("code_iso") or "").upper(): r["nb"] for r in rows_i}
 
@@ -652,8 +605,8 @@ with _cov2:
     st.metric("Traités (pipeline)", f"{_tot_traites:,}",
               help="Noms du dump déjà soumis au pipeline de vérification (checkpoint)")
 with _cov3:
-    st.metric("PEP détectés", f"{_tot_inseres:,}",
-              help="PEP uniques confirmés par le pipeline (est_pep=true). Inclut les vérifications dry_run non stockées en base.")
+    st.metric("Confirmés en base", f"{_tot_inseres:,}",
+              help="PEP confirmés insérés en base dont l'identité existe dans le dump")
 with _cov4:
     st.metric("Restants à traiter", f"{_tot_restant:,}",
               help="PEP du dump pas encore passés dans le pipeline")
@@ -690,7 +643,7 @@ st.dataframe(
     column_config={
         "Dans dump": st.column_config.NumberColumn("Dans dump 🗄️",       format="%d"),
         "Traités":   st.column_config.NumberColumn("Traités ✅",           format="%d"),
-        "Insérés":   st.column_config.NumberColumn("PEP détectés 🎯",     format="%d"),
+        "Insérés":   st.column_config.NumberColumn("Confirmés en base 📥", format="%d"),
         "Restants":  st.column_config.NumberColumn("Restants ⏳",          format="%d"),
         "% couvert": st.column_config.ProgressColumn("Couverture",
                          format="%d%%", min_value=0, max_value=100),
